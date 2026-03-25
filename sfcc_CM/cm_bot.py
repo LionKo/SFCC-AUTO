@@ -26,7 +26,63 @@ BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = BASE_DIR / "CM_PNG"
 LOG_DIR = BASE_DIR / "logs"
 PROCESS_NAME = "FootballClubChampions.exe"
-GAME_EXE_PATH = Path(r"D:\Program Files (x86)\Steam\steamapps\common\SegaFCC\FootballClubChampions.exe")
+
+
+def get_steam_game_path(game_folder_name: str = "SegaFCC") -> Path | None:
+    """
+    定位 Steam 游戏的安装路径
+    
+    Args:
+        game_folder_name: Steam 游戏文件夹名称（默认为 "SegaFCC"）
+    
+    Returns:
+        游戏可执行文件的完整路径，如果找不到则返回 None
+    """
+    import winreg
+    
+    # 方案 1: 从 Windows 注册表读取 Steam 安装目录
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+            steam_path = winreg.QueryValueEx(key, "SteamPath")[0]
+            steam_path = Path(steam_path)
+    except Exception:
+        logging.debug("Failed to read Steam path from registry")
+        steam_path = None
+    
+    # 方案 2: 如果注册表读取失败，尝试常见的 Steam 安装位置
+    common_steam_paths = [
+        Path("C:/Program Files/Steam"),
+        Path("C:/Program Files (x86)/Steam"),
+        Path("D:/SteamLibrary"),
+        Path("E:/SteamLibrary"),
+        Path.home() / ".steam/steam",  # Linux compatibility
+    ]
+    
+    if steam_path and steam_path.exists():
+        candidate_paths = [steam_path]
+    else:
+        candidate_paths = common_steam_paths
+    
+    # 查找游戏文件夹
+    game_exe_name = "FootballClubChampions.exe"
+    
+    for steam_dir in candidate_paths:
+        game_path = steam_dir / "steamapps" / "common" / game_folder_name / game_exe_name
+        if game_path.exists():
+            logging.info(f"Found game at: {game_path}")
+            return game_path
+    
+    logging.warning(f"Could not find {game_exe_name} in any known Steam directory")
+    return None
+
+
+# 尝试自动获取游戏路径
+GAME_EXE_PATH = get_steam_game_path("SegaFCC")
+
+# 如果自动查找失败，使用备用路径（用户可以手动修改）
+if GAME_EXE_PATH is None:
+    GAME_EXE_PATH = Path(r"D:\Program Files (x86)\Steam\steamapps\common\SegaFCC\FootballClubChampions.exe")
+    logging.warning(f"Using fallback game path: {GAME_EXE_PATH}")
 EMERGENCY_PRIORITY_BUTTONS = ["close_button", "login_retry"]
 CONFIRM_BUTTONS = ["ok_button", "ok_chs_button"]
 PRIORITY1_BUTTONS = [
