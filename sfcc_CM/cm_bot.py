@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -26,70 +27,14 @@ BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = BASE_DIR / "CM_PNG"
 LOG_DIR = BASE_DIR / "logs"
 PROCESS_NAME = "FootballClubChampions.exe"
-
-
-def get_steam_game_path(game_folder_name: str = "SegaFCC") -> Path | None:
-    """
-    定位 Steam 游戏的安装路径
-    
-    Args:
-        game_folder_name: Steam 游戏文件夹名称（默认为 "SegaFCC"）
-    
-    Returns:
-        游戏可执行文件的完整路径，如果找不到则返回 None
-    """
-    import winreg
-    
-    # 方案 1: 从 Windows 注册表读取 Steam 安装目录
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
-            steam_path = winreg.QueryValueEx(key, "SteamPath")[0]
-            steam_path = Path(steam_path)
-    except Exception:
-        logging.debug("Failed to read Steam path from registry")
-        steam_path = None
-    
-    # 方案 2: 如果注册表读取失败，尝试常见的 Steam 安装位置
-    common_steam_paths = [
-        Path("C:/Program Files/Steam"),
-        Path("C:/Program Files (x86)/Steam"),
-        Path("D:/SteamLibrary"),
-        Path("E:/SteamLibrary"),
-        Path.home() / ".steam/steam",  # Linux compatibility
-    ]
-    
-    if steam_path and steam_path.exists():
-        candidate_paths = [steam_path]
-    else:
-        candidate_paths = common_steam_paths
-    
-    # 查找游戏文件夹
-    game_exe_name = "FootballClubChampions.exe"
-    
-    for steam_dir in candidate_paths:
-        game_path = steam_dir / "steamapps" / "common" / game_folder_name / game_exe_name
-        if game_path.exists():
-            logging.info(f"Found game at: {game_path}")
-            return game_path
-    
-    logging.warning(f"Could not find {game_exe_name} in any known Steam directory")
-    return None
-
-
-# 尝试自动获取游戏路径
-GAME_EXE_PATH = get_steam_game_path("SegaFCC")
-
-# 如果自动查找失败，使用备用路径（用户可以手动修改）
-if GAME_EXE_PATH is None:
-    GAME_EXE_PATH = Path(r"D:\Program Files (x86)\Steam\steamapps\common\SegaFCC\FootballClubChampions.exe")
-    logging.warning(f"Using fallback game path: {GAME_EXE_PATH}")
+DEFAULT_STEAM_GAME_ID = ""
+DEFAULT_STEAM_LAUNCH_URL = ""
 EMERGENCY_PRIORITY_BUTTONS = ["close_button", "login_retry"]
 CONFIRM_BUTTONS = ["ok_button", "ok_chs_button"]
 PRIORITY1_BUTTONS = [
     "close_button",
     "login_retry",
     "match_result_button",
-    "club_transfers_renewal_button",
     "ok_button",
     "skip_button",
     "skip_button2",
@@ -118,7 +63,7 @@ MAIN_SCREEN_EXTRA_MARKERS = [
     "creative_mode_special_training_button2",
     "creative_mode_special_training_button3",
 ]
-STARTUP_RECOVERY_SECONDS = 30.0
+STARTUP_RECOVERY_SECONDS = 60.0
 SPEED_ALREADY_THREE_MARKERS = ["creative_mode_speed3"]
 SPEED_SWITCH_TRIGGER_BUTTONS = ["creative_mode_speed1"]
 MATCH_REWARD_SPEED_SWITCH_MARKERS = ["match_reward_speed1"]
@@ -173,12 +118,12 @@ MAIN_SCREEN_SCHEDULE_RATIOS = [
 CLUB_TRANSFERS_MIN_RATIO = (0.334, 0.642)
 EXPECTED_CLIENT_WIDTH = 1920
 EXPECTED_CLIENT_HEIGHT = 1080
-SCREEN_STUCK_TIMEOUT_SECONDS = 300.0
-NO_SCHEDULE_TIMEOUT_SECONDS = 1800.0
+SCREEN_STUCK_TIMEOUT_SECONDS = 120.0
+NO_SCHEDULE_TIMEOUT_SECONDS = 900.0
 BOOTSTRAP_TIMEOUT_SECONDS = 180.0
 BOOTSTRAP_POST_LOGIN_GAME_MAIN_SECONDS = 20.0
-VISUAL_STALL_TIMEOUT_SECONDS = 300.0
-VISUAL_STALL_CHECK_INTERVAL_SECONDS = 10.0
+VISUAL_STALL_TIMEOUT_SECONDS = 120.0
+VISUAL_STALL_CHECK_INTERVAL_SECONDS = 5.0
 VISUAL_STALL_DIFF_THRESHOLD = 1.2
 LOGIN_SCREEN_THRESHOLD = 0.55
 STAGE_SCAN_BASE_INTERVAL_SECONDS = 4.0
@@ -765,12 +710,18 @@ class CreativeModeBot:
         main_threshold: float,
         button_threshold: float,
         dialog_threshold: float,
+        steam_game_id: str = "",
+        steam_launch_url: str = "",
+        game_exe_path: Path | None = None,
     ) -> None:
         self.vision = vision
         self.window = window
         self.main_threshold = main_threshold
         self.button_threshold = button_threshold
         self.dialog_threshold = dialog_threshold
+        self.steam_game_id = steam_game_id.strip()
+        self.steam_launch_url = steam_launch_url.strip()
+        self.game_exe_path = game_exe_path
         now = time.time()
         self.last_advance_schedule_click_time = 0.0
         self.last_stage_signature = "initializing"
@@ -838,17 +789,37 @@ class CreativeModeBot:
         return self._pick_best_match(*present_strong, *support_matches)
 
     def launch_game(self) -> bool:
-        if not GAME_EXE_PATH.exists():
-            logging.error("Game executable does not exist: %s", GAME_EXE_PATH)
-            return False
-        try:
-            subprocess.Popen([str(GAME_EXE_PATH)], cwd=str(GAME_EXE_PATH.parent))
-        except Exception:
-            logging.exception("Failed to launch game: %s", GAME_EXE_PATH)
-            return False
-        logging.info("Launched game: %s", GAME_EXE_PATH)
-        self.window.hwnd = None
-        return True
+        launch_target = self.steam_launch_url
+        if not launch_target and self.steam_game_id:
+            launch_target = f"steam://rungameid/{self.steam_game_id}"
+
+        if launch_target:
+            try:
+                os.startfile(launch_target)
+            except Exception:
+                logging.exception("Failed to launch game via Steam URL: %s", launch_target)
+            else:
+                logging.info("Launched game via Steam URL: %s", launch_target)
+                self.window.hwnd = None
+                return True
+
+        if self.game_exe_path is not None:
+            if not self.game_exe_path.exists():
+                logging.error("Configured game executable does not exist: %s", self.game_exe_path)
+                return False
+            try:
+                subprocess.Popen([str(self.game_exe_path)], cwd=str(self.game_exe_path.parent))
+            except Exception:
+                logging.exception("Failed to launch game executable: %s", self.game_exe_path)
+                return False
+            logging.info("Launched game executable: %s", self.game_exe_path)
+            self.window.hwnd = None
+            return True
+
+        logging.error(
+            "No launch method configured. Set --steam-game-id, --steam-launch-url, or --game-exe-path."
+        )
+        return False
 
     def wait_for_process_window(self, timeout_seconds: float = 60.0) -> bool:
         deadline = time.time() + timeout_seconds
@@ -1622,12 +1593,55 @@ class CreativeModeBot:
         logging.info("Clicking main-screen special training hotspot at (%s, %s)", x, y)
         self.window.click_client(x, y, settle=settle)
 
+    def click_special_training_back_hotspot(self, settle: float = 0.35) -> None:
+        x = max(1, int(EXPECTED_CLIENT_WIDTH * 0.036))
+        y = max(1, int(EXPECTED_CLIENT_HEIGHT * 0.050))
+        logging.info("Clicking special-training back hotspot at (%s, %s)", x, y)
+        self.window.click_client(x, y, settle=settle)
+
     def click_main_screen_schedule_hotspot(self, variant: int = 0, settle: float = 0.5) -> None:
         x_ratio, y_ratio = MAIN_SCREEN_SCHEDULE_RATIOS[min(max(variant, 0), len(MAIN_SCREEN_SCHEDULE_RATIOS) - 1)]
         x = int(EXPECTED_CLIENT_WIDTH * x_ratio)
         y = int(EXPECTED_CLIENT_HEIGHT * y_ratio)
         logging.info("Clicking main-screen schedule-card hotspot #%s at (%s, %s)", variant + 1, x, y)
         self.window.click_client(x, y, settle=settle)
+
+    def dismiss_main_screen_overlay_if_present(self) -> bool:
+        screenshot = self.vision.capture()
+        popup = self.vision.match_best(
+            screenshot,
+            SPEED_POPUP_MARKERS,
+            min(self.dialog_threshold, 0.68),
+        )
+        if popup:
+            logging.info("Speed popup is still visible, dismissing it with an outside click")
+            self.window.click_client(
+                int(EXPECTED_CLIENT_WIDTH * 0.78),
+                int(EXPECTED_CLIENT_HEIGHT * 0.18),
+                settle=0.15,
+            )
+            return True
+
+        confirm = self.vision.match_best(
+            screenshot,
+            CONFIRM_BUTTONS,
+            min(self.button_threshold, 0.72),
+        )
+        if confirm:
+            logging.info("Dismissing overlay via confirm button %s (score=%.3f)", confirm.name, confirm.score)
+            self.click_match(confirm, settle=0.2)
+            return True
+
+        if self.find_main_screen_in_screenshot(screenshot) or self.find_match_reward_screen_in_screenshot(screenshot):
+            logging.info("No popup marker detected after speed click, nudging an outside click to clear any overlay")
+            self.window.click_client(
+                int(EXPECTED_CLIENT_WIDTH * 0.78),
+                int(EXPECTED_CLIENT_HEIGHT * 0.18),
+                settle=0.15,
+            )
+            return True
+
+        return False
 
     def find_special_training_entry_on_main_screen(self, screenshot: np.ndarray) -> MatchResult | None:
         return self.vision.match_best_in_region(
@@ -1636,6 +1650,51 @@ class CreativeModeBot:
             min(self.button_threshold, 0.72),
             REGION_BOTTOM_HALF,
         )
+
+    def is_confirmed_main_screen(self, screenshot: np.ndarray | None = None) -> bool:
+        screenshot = screenshot if screenshot is not None else self.vision.capture()
+        if self.find_special_training_screen_in_screenshot(screenshot):
+            return False
+        if self.find_match_reward_screen_in_screenshot(screenshot):
+            return False
+        if self.find_club_transfers_screen_in_screenshot(screenshot):
+            return False
+        if self.find_club_transfers_level_screen_in_screenshot(screenshot):
+            return False
+        if self.find_sp_join_screen_in_screenshot(screenshot):
+            return False
+        if self.find_final_confirm_screen_in_screenshot(screenshot):
+            return False
+        if self.find_login_screen_in_screenshot(screenshot):
+            return False
+        if self.find_game_main_screen_in_screenshot(screenshot):
+            return False
+        if self.find_save_selection_screen_in_screenshot(screenshot):
+            return False
+        return self.find_main_screen_in_screenshot(screenshot) is not None
+
+    def has_returned_to_main_from_special_training(self, screenshot: np.ndarray | None = None) -> bool:
+        screenshot = screenshot if screenshot is not None else self.vision.capture()
+        if self.find_special_training_screen_in_screenshot(screenshot):
+            return False
+
+        main_screen = self.find_main_screen_in_screenshot(screenshot)
+        if not main_screen:
+            return False
+
+        speed_marker = self.vision.match_best_in_region(
+            screenshot,
+            SPEED_SWITCH_TRIGGER_BUTTONS + SPEED_ALREADY_THREE_MARKERS,
+            min(self.button_threshold, 0.68),
+            REGION_TOP_RIGHT,
+        )
+        extra_marker = self.vision.match_best_in_region(
+            screenshot,
+            MAIN_SCREEN_EXTRA_MARKERS,
+            min(self.button_threshold, 0.78),
+            REGION_BOTTOM_HALF,
+        )
+        return speed_marker is not None or extra_marker is not None
 
     def find_event_choice_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
         choice = self.vision.match_best(
@@ -1764,12 +1823,34 @@ class CreativeModeBot:
             return match
         return self.click_named_button(names, timeout=1.0, settle=settle)
 
-    def detect_main_screen_speed_state(self, screenshot: np.ndarray | None = None) -> tuple[str, MatchResult | None]:
+    def detect_speed_state(
+        self,
+        screenshot: np.ndarray | None = None,
+        prefer_reward_context: bool = False,
+        speed_one_threshold: float = SPEED_ONE_THRESHOLD,
+        speed_three_threshold: float = SPEED_THREE_CONFIRM_THRESHOLD,
+    ) -> tuple[str, MatchResult | None]:
         if screenshot is None:
             screenshot = self.vision.capture()
 
-        speed_one = self.vision.match_best(screenshot, SPEED_SWITCH_TRIGGER_BUTTONS, SPEED_ONE_THRESHOLD)
-        speed_three = self.vision.match_best(screenshot, SPEED_ALREADY_THREE_MARKERS, SPEED_THREE_CONFIRM_THRESHOLD)
+        speed_one: MatchResult | None = None
+        if prefer_reward_context:
+            reward_speed_one_threshold = min(speed_one_threshold, 0.62)
+            speed_one = self.vision.match_best_in_region(
+                screenshot,
+                MATCH_REWARD_SPEED_SWITCH_MARKERS,
+                reward_speed_one_threshold,
+                REGION_TOP_RIGHT,
+            )
+
+        if not speed_one:
+            speed_one = self.vision.match_best(
+                screenshot,
+                SPEED_SWITCH_TRIGGER_BUTTONS + MATCH_REWARD_SPEED_SWITCH_MARKERS,
+                speed_one_threshold,
+            )
+
+        speed_three = self.vision.match_best(screenshot, SPEED_ALREADY_THREE_MARKERS, speed_three_threshold)
 
         if speed_one:
             return "one", speed_one
@@ -1777,16 +1858,32 @@ class CreativeModeBot:
             return "three", speed_three
         return "unknown", None
 
-    def ensure_speed_three(self) -> bool:
-        screenshot = self.vision.capture()
-        speed_state, speed_marker = self.detect_main_screen_speed_state(screenshot)
+    def ensure_speed_three(
+        self,
+        screenshot: np.ndarray | None = None,
+        prefer_reward_context: bool = False,
+    ) -> bool:
+        screenshot = screenshot if screenshot is not None else self.vision.capture()
+        speed_state, speed_marker = self.detect_speed_state(
+            screenshot,
+            prefer_reward_context=prefer_reward_context,
+        )
         if speed_state == "three":
             logging.info("3x speed already active via %s (score=%.3f)", speed_marker.name, speed_marker.score)
             return True
 
         if speed_state != "one" or not speed_marker:
-            speed_one_loose = self.vision.match_best(screenshot, SPEED_SWITCH_TRIGGER_BUTTONS, min(SPEED_ONE_THRESHOLD, 0.50))
-            speed_three_loose = self.vision.match_best(screenshot, SPEED_ALREADY_THREE_MARKERS, min(SPEED_THREE_CONFIRM_THRESHOLD, 0.50))
+            loose_speed_one_threshold = min(SPEED_ONE_THRESHOLD, 0.55 if prefer_reward_context else 0.50)
+            speed_state_loose, speed_marker_loose = self.detect_speed_state(
+                screenshot,
+                prefer_reward_context=prefer_reward_context,
+                speed_one_threshold=loose_speed_one_threshold,
+                speed_three_threshold=min(SPEED_THREE_CONFIRM_THRESHOLD, 0.50),
+            )
+            speed_one_loose = speed_marker_loose if speed_state_loose == "one" else None
+            speed_three_loose = speed_marker_loose if speed_state_loose == "three" else None
+            if speed_one_loose:
+                speed_marker = speed_one_loose
             if speed_one_loose:
                 logging.info(
                     "Speed switch skipped: speed1-like marker %s seen but below confident threshold (score=%.3f, required=%.3f)",
@@ -1803,13 +1900,14 @@ class CreativeModeBot:
                 )
             else:
                 logging.info("Speed switch skipped: no speed1/speed3 marker was confidently detected on the current screen")
-            return False
+            if not speed_one_loose:
+                return False
 
         for attempt in range(1, 2):
             logging.info("Switching speed to 3x, attempt %s", attempt)
             self.click_match(speed_marker, settle=0.5)
 
-            speed_state_after_click, _ = self.detect_main_screen_speed_state()
+            speed_state_after_click, _ = self.detect_speed_state(prefer_reward_context=prefer_reward_context)
             if speed_state_after_click == "three":
                 logging.info("3x speed confirmed immediately after clicking the speed control")
                 return True
@@ -1831,13 +1929,39 @@ class CreativeModeBot:
                 logging.info("3x speed assumed active because speed popup closed")
                 return True
 
-            speed_state_after_popup, _ = self.detect_main_screen_speed_state()
+            speed_state_after_popup, _ = self.detect_speed_state(prefer_reward_context=prefer_reward_context)
             if speed_state_after_popup == "three":
                 logging.info("3x speed confirmed")
                 return True
 
         logging.warning("Failed to confirm 3x speed quickly, continuing")
         return False
+
+    def find_main_screen_recovery_hint(self, screenshot: np.ndarray) -> MatchResult | None:
+        main_button = self.vision.match_best_in_region(
+            screenshot,
+            MAIN_SCREEN_BUTTONS,
+            min(self.main_threshold, 0.60),
+            REGION_BOTTOM_RIGHT,
+        )
+        extra_marker = self.vision.match_best_in_region(
+            screenshot,
+            MAIN_SCREEN_EXTRA_MARKERS,
+            min(self.button_threshold, 0.78),
+            REGION_BOTTOM_HALF,
+        )
+        speed_marker = self.vision.match_best_in_region(
+            screenshot,
+            SPEED_SWITCH_TRIGGER_BUTTONS + SPEED_ALREADY_THREE_MARKERS,
+            min(self.button_threshold, 0.66),
+            REGION_TOP_RIGHT,
+        )
+
+        if main_button:
+            return self._pick_best_match(main_button, extra_marker, speed_marker)
+        if extra_marker and speed_marker:
+            return self._pick_best_match(extra_marker, speed_marker)
+        return None
 
     def handle_speed_one_anywhere(self) -> bool:
         screenshot = self.vision.capture()
@@ -1850,7 +1974,7 @@ class CreativeModeBot:
             )
             return False
 
-        speed_state, speed_marker = self.detect_main_screen_speed_state(screenshot)
+        speed_state, speed_marker = self.detect_speed_state(screenshot)
         if speed_state == "three" and speed_marker:
             logging.debug(
                 "Skipping speed switch because 3x speed is already active via %s (score=%.3f)",
@@ -1860,7 +1984,11 @@ class CreativeModeBot:
             return False
 
         if speed_state != "one" or not speed_marker:
-            speed_one_loose = self.vision.match_best(screenshot, SPEED_SWITCH_TRIGGER_BUTTONS, min(SPEED_ONE_THRESHOLD, 0.50))
+            speed_one_loose = self.vision.match_best(
+                screenshot,
+                SPEED_SWITCH_TRIGGER_BUTTONS + MATCH_REWARD_SPEED_SWITCH_MARKERS,
+                min(SPEED_ONE_THRESHOLD, 0.50),
+            )
             speed_three_loose = self.vision.match_best(screenshot, SPEED_ALREADY_THREE_MARKERS, min(SPEED_THREE_CONFIRM_THRESHOLD, 0.50))
             if speed_one_loose:
                 logging.debug(
@@ -1981,7 +2109,12 @@ class CreativeModeBot:
         match: MatchResult | None = None,
         hotspot_variant: int = 0,
         settle_between: float = 0.18,
-    ) -> None:
+    ) -> bool:
+        screenshot = self.vision.capture()
+        if not self.is_confirmed_main_screen(screenshot):
+            logging.warning("Skipping advance schedule action because the current screen is not a confirmed creative mode main screen")
+            return False
+
         if match:
             logging.info(
                 "Executing advance schedule action with a single click on matched target %s at (%s,%s)",
@@ -1990,10 +2123,11 @@ class CreativeModeBot:
                 match.center[1],
             )
             self.click_match(match, settle=settle_between)
-            return
+            return True
 
         logging.info("Executing advance schedule action with a single click on schedule-card hotspot #%s", hotspot_variant + 1)
         self.click_main_screen_schedule_hotspot(variant=hotspot_variant, settle=settle_between)
+        return True
 
     def poll_until_main_screen_returns(self, max_wait_seconds: float) -> bool:
         logging.info("Waiting for creative mode main screen to return")
@@ -2009,6 +2143,14 @@ class CreativeModeBot:
                 logging.info("Returned to creative mode main screen")
                 return True
 
+            if (
+                self.find_login_screen_in_screenshot(screenshot)
+                or self.find_game_main_screen_in_screenshot(screenshot)
+                or self.find_save_selection_screen_in_screenshot(screenshot)
+            ):
+                logging.info("Wait-for-main detected bootstrap stage, switching to bootstrap flow immediately")
+                return self.run_bootstrap_flow()
+
             if self.handle_global_priority_buttons():
                 continue
 
@@ -2019,12 +2161,6 @@ class CreativeModeBot:
                 continue
 
             if self.handle_connecting_screen():
-                continue
-
-            if self.run_back_recovery_flow():
-                if self.is_main_screen():
-                    logging.info("Returned to creative mode main screen via back-button recovery while waiting")
-                    return True
                 continue
 
             if self.handle_speed_one_anywhere():
@@ -2191,14 +2327,34 @@ class CreativeModeBot:
 
         logging.info("Match reward screen detected, ensuring 3x speed before continuing")
         screenshot = self.vision.capture()
-        reward_speed_one = self.vision.match_best(screenshot, MATCH_REWARD_SPEED_SWITCH_MARKERS, SPEED_ONE_THRESHOLD)
-        if reward_speed_one:
-            logging.info("Match reward screen still shows 1x speed, switching to 3x")
-            if self.ensure_speed_three():
+        reward_speed_state, reward_speed_marker = self.detect_speed_state(
+            screenshot,
+            prefer_reward_context=True,
+        )
+        reward_speed_one_loose = None
+        if reward_speed_state == "unknown":
+            reward_speed_one_loose = self.vision.match_best_in_region(
+                screenshot,
+                MATCH_REWARD_SPEED_SWITCH_MARKERS,
+                min(SPEED_ONE_THRESHOLD, 0.55),
+                REGION_TOP_RIGHT,
+            )
+
+        if reward_speed_state == "one" or reward_speed_one_loose:
+            marker = reward_speed_marker if reward_speed_state == "one" else reward_speed_one_loose
+            assert marker is not None
+            logging.info("Match reward screen shows 1x speed via %s, switching to 3x", marker.name)
+            if self.ensure_speed_three(screenshot=screenshot, prefer_reward_context=True):
                 return True
             logging.info("3x speed switch was not confirmed, continuing with reward-screen dismissal")
+        elif reward_speed_state == "three" and reward_speed_marker:
+            logging.info(
+                "Match reward screen already appears to be at 3x speed via %s (score=%.3f)",
+                reward_speed_marker.name,
+                reward_speed_marker.score,
+            )
         else:
-            logging.info("Match reward screen does not currently show the 1x speed marker")
+            logging.info("Match reward screen does not currently show a usable speed marker")
 
         screenshot = self.vision.capture()
         button = self.vision.match_best(
@@ -2348,9 +2504,6 @@ class CreativeModeBot:
                 continue
 
             if self.handle_post_schedule_events(max_clicks=6):
-                continue
-
-            if self.run_back_recovery_flow():
                 continue
 
             stage = self.update_runtime_stage()
@@ -2560,10 +2713,18 @@ class CreativeModeBot:
         ):
             return False
 
+        screenshot = self.vision.capture()
+        if not self.is_confirmed_main_screen(screenshot):
+            logging.info("Recovery is on a non-main screen without a higher-priority flow, clicking top-left back hotspot first")
+            self.click_special_training_back_hotspot(settle=0.35)
+            return True
+
         self.window.move_cursor_client(x_ratio=0.92, y_ratio=0.92)
         back_button = self.vision.wait_for_any(BACK_BUTTONS, self.button_threshold, timeout=1.5, interval=0.2)
         if not back_button:
-            return False
+            logging.info("Back-button template was not detected during recovery, clicking top-left back hotspot")
+            self.click_special_training_back_hotspot(settle=0.35)
+            return True
 
         logging.info("Back-button recovery detected, clicking return")
         self.click_match(back_button, settle=1.0)
@@ -2624,6 +2785,23 @@ class CreativeModeBot:
                     logging.info("Recovery found creative mode main screen")
                 return True
 
+            recovery_main_hint = self.find_main_screen_recovery_hint(screenshot)
+            if recovery_main_hint and not (
+                self.find_special_training_screen_in_screenshot(screenshot)
+                or self.find_match_reward_screen_in_screenshot(screenshot)
+                or self.find_club_transfers_screen_in_screenshot(screenshot)
+                or self.find_club_transfers_level_screen_in_screenshot(screenshot)
+                or self.find_sp_join_screen_in_screenshot(screenshot)
+                or self.find_final_confirm_screen_in_screenshot(screenshot)
+            ):
+                self.set_active_flow("main")
+                logging.info(
+                    "Recovery accepted creative mode main screen via main-action hint %s (score=%.3f)",
+                    recovery_main_hint.name,
+                    recovery_main_hint.score,
+                )
+                return True
+
             if (
                 self.find_login_screen_in_screenshot(screenshot)
                 or self.find_game_main_screen_in_screenshot(screenshot)
@@ -2636,6 +2814,13 @@ class CreativeModeBot:
             if self.run_new_season_flow(screenshot):
                 logging.info("Handled new season flow during recovery")
                 return True
+
+            if self.run_back_recovery_flow():
+                if self.is_main_screen():
+                    self.set_active_flow("main")
+                    logging.info("Recovered to creative mode main screen via back-button recovery")
+                    return True
+                continue
 
             if self.handle_global_priority_buttons(max_clicks=3):
                 if self.is_main_screen():
@@ -2661,18 +2846,30 @@ class CreativeModeBot:
                     return True
                 continue
 
+            if self.handle_match_reward_screen():
+                continue
+
+            main_after_reward = self.find_main_screen_recovery_hint(self.vision.capture())
+            if main_after_reward:
+                self.set_active_flow("main")
+                logging.info(
+                    "Recovery accepted creative mode main screen after reward handling via %s (score=%.3f)",
+                    main_after_reward.name,
+                    main_after_reward.score,
+                )
+                return True
+
             if self.handle_speed_one_anywhere():
-                if self.last_stage_signature == "creative_mode_main" or self.should_trust_main_screen():
+                refreshed = self.vision.capture()
+                if self.find_main_screen_in_screenshot(refreshed) or self.find_main_screen_recovery_hint(refreshed):
                     self.set_active_flow("main")
                     logging.info("Recovery resumed main flow immediately after speed handling on creative mode main screen")
                     return True
                 continue
 
-            if self.handle_match_reward_screen():
-                continue
-
             if self.handle_generic_confirm_fallback(min_interval=0.8):
-                if self.is_main_screen():
+                refreshed = self.vision.capture()
+                if self.find_main_screen_in_screenshot(refreshed) or self.find_main_screen_recovery_hint(refreshed):
                     logging.info("Recovered to creative mode main screen via generic confirm fallback")
                     return True
                 continue
@@ -2702,7 +2899,11 @@ class CreativeModeBot:
         for attempt in range(1, 3):
             if not self.check_runtime_health():
                 return False
-            match = self.find_special_training_entry_on_main_screen(self.vision.capture())
+            screenshot = self.vision.capture()
+            if not self.is_confirmed_main_screen(screenshot):
+                logging.info("Skipping special training entry because the current screen is not a confirmed creative mode main screen")
+                return False
+            match = self.find_special_training_entry_on_main_screen(screenshot)
             if not match:
                 logging.info("Special training template not found, using hotspot fallback on attempt %s", attempt)
                 self.click_main_screen_special_training_hotspot(settle=0.5)
@@ -2725,7 +2926,11 @@ class CreativeModeBot:
         for attempt in range(1, 3):
             if not self.check_runtime_process_only():
                 return False
-            match = self.find_special_training_entry_on_main_screen(self.vision.capture())
+            screenshot = self.vision.capture()
+            if not self.is_confirmed_main_screen(screenshot):
+                logging.info("Fast path skipped special training entry because the current screen is not a confirmed creative mode main screen")
+                return False
+            match = self.find_special_training_entry_on_main_screen(screenshot)
             if not match:
                 logging.info("Fast path using special training hotspot fallback on attempt %s", attempt)
                 self.click_main_screen_special_training_hotspot(settle=0.5)
@@ -2805,9 +3010,14 @@ class CreativeModeBot:
             self.window.move_cursor_client(x_ratio=0.92, y_ratio=0.92)
             back_button = self.vision.wait_for_any(BACK_BUTTONS, self.button_threshold, timeout=1.0, interval=0.2)
             if not back_button:
-                if self.vision.wait_for_any(MAIN_SCREEN_BUTTONS, min(self.main_threshold, 0.75), timeout=1.2, interval=0.2):
+                screenshot = self.vision.capture()
+                if self.has_returned_to_main_from_special_training(screenshot):
                     logging.info("Returned from special training to main screen")
                     return True
+                if self.find_special_training_screen_in_screenshot(screenshot):
+                    logging.info("Back button not detected on special training screen, clicking top-left back hotspot")
+                    self.click_special_training_back_hotspot(settle=0.45)
+                    continue
                 if self.handle_global_priority_buttons(max_clicks=1):
                     return True
                 logging.warning("Back button disappeared, but main screen could not be confirmed")
@@ -2815,24 +3025,38 @@ class CreativeModeBot:
 
             logging.info("Clicking back button, attempt %s", attempt)
             self.click_match(back_button, settle=0.5)
+            self.handle_optional_confirm_dialog("special_training_execute_confirm_next_dialog")
+            self.handle_optional_confirm_dialog("special_training_execute_confirm_dialog")
 
             self.window.move_cursor_client(x_ratio=0.92, y_ratio=0.92)
-            if self.vision.wait_for_any(BACK_BUTTONS, self.button_threshold, timeout=0.6, interval=0.2):
-                logging.warning("Back button still visible after click, retrying")
+            screenshot = self.vision.capture()
+            if self.find_special_training_screen_in_screenshot(screenshot):
+                if self.vision.wait_for_any(BACK_BUTTONS, self.button_threshold, timeout=0.6, interval=0.2):
+                    logging.warning("Back button still visible after click, retrying")
+                    continue
+                logging.info("Special training still visible after back click, clicking top-left back hotspot")
+                self.click_special_training_back_hotspot(settle=0.45)
                 continue
 
             if self.handle_global_priority_buttons(max_clicks=1):
                 return True
 
-            if self.vision.wait_for_any(MAIN_SCREEN_BUTTONS, min(self.main_threshold, 0.75), timeout=1.5, interval=0.2):
+            screenshot = self.vision.capture()
+            if self.has_returned_to_main_from_special_training(screenshot):
                 logging.info("Returned from special training to main screen")
                 return True
+
+            if self.vision.wait_for_any(BACK_BUTTONS, self.button_threshold, timeout=0.6, interval=0.2):
+                logging.warning("Back button still visible after click, retrying")
+                continue
+
+            logging.warning("Back button click completed, but return to main screen is still unconfirmed")
 
         logging.warning("Back button remained visible after repeated clicks")
         return False
 
     def leave_special_training_fast(self) -> bool:
-        for attempt in range(1, 5):
+        for attempt in range(1, 7):
             if not self.check_runtime_process_only():
                 return False
             self.window.move_cursor_client(x_ratio=0.92, y_ratio=0.92)
@@ -2844,19 +3068,39 @@ class CreativeModeBot:
                 interval=0.12,
             )
             if not back_button:
-                if self.wait_for_any_in_region(
-                    MAIN_SCREEN_BUTTONS,
-                    min(self.main_threshold, 0.75),
-                    REGION_BOTTOM_RIGHT,
-                    timeout=0.8,
-                    interval=0.12,
-                ):
+                screenshot = self.vision.capture()
+                if self.has_returned_to_main_from_special_training(screenshot):
                     logging.info("Fast path returned from special training to main screen")
                     return True
+                if self.find_special_training_screen_in_screenshot(screenshot):
+                    logging.info("Fast path could not detect back button, clicking top-left back hotspot")
+                    self.click_special_training_back_hotspot(settle=0.25)
+                    continue
                 return False
 
             logging.info("Fast path clicking back button from special training, attempt %s", attempt)
             self.click_match(back_button, settle=0.25)
+            self.handle_optional_confirm_dialog_fast("special_training_execute_confirm_next_dialog")
+            self.handle_optional_confirm_dialog_fast("special_training_execute_confirm_dialog")
+
+            deadline = time.time() + 1.2
+            while time.time() < deadline:
+                screenshot = self.vision.capture()
+                if self.has_returned_to_main_from_special_training(screenshot):
+                    logging.info("Fast path returned from special training to main screen")
+                    return True
+                if not self.find_special_training_screen_in_screenshot(screenshot):
+                    if self.handle_global_priority_buttons(max_clicks=1, initial_screenshot=screenshot):
+                        continue
+                    time.sleep(0.12)
+                    continue
+                break
+
+            if self.find_special_training_screen_in_screenshot(self.vision.capture()):
+                logging.info("Fast path still sees special training after back click, clicking top-left back hotspot")
+                self.click_special_training_back_hotspot(settle=0.25)
+                continue
+
             if self.wait_for_any_in_region(
                 MAIN_SCREEN_BUTTONS,
                 min(self.main_threshold, 0.75),
@@ -2937,7 +3181,11 @@ class CreativeModeBot:
                 return False
             self.handle_global_priority_buttons()
             screenshot = self.vision.capture()
+            if not self.is_confirmed_main_screen(screenshot):
+                logging.warning("Advance schedule aborted because the current screen is not a confirmed creative mode main screen")
+                return False
             match = self.find_advance_schedule_button_in_screenshot(screenshot)
+            action_clicked = False
             if not match:
                 match = self.click_named_button_in_region(
                     MAIN_SCREEN_BUTTONS,
@@ -2947,12 +3195,21 @@ class CreativeModeBot:
                     interval=0.12,
                     settle=0.5,
                 )
+                if match:
+                    action_clicked = True
             if not match:
                 logging.warning("Advance schedule button not found in dedicated schedule ROI, using main-screen schedule hotspot fallback")
-                self.click_advance_schedule_action(match=None, hotspot_variant=(attempt - 1) % len(MAIN_SCREEN_SCHEDULE_RATIOS), settle_between=0.16)
+                action_clicked = self.click_advance_schedule_action(
+                    match=None,
+                    hotspot_variant=(attempt - 1) % len(MAIN_SCREEN_SCHEDULE_RATIOS),
+                    settle_between=0.16,
+                )
             else:
                 logging.info("Advance schedule matched via template: %s (score=%.3f)", match.name, match.score)
-                self.click_advance_schedule_action(match=match, settle_between=0.16)
+                action_clicked = self.click_advance_schedule_action(match=match, settle_between=0.16)
+            if not action_clicked:
+                logging.warning("Advance schedule action was skipped, aborting the current advance attempt")
+                return False
             self.last_advance_schedule_click_time = time.time()
             time.sleep(0.4)
 
@@ -3021,7 +3278,11 @@ class CreativeModeBot:
                 continue
 
             screenshot = self.vision.capture()
+            if not self.is_confirmed_main_screen(screenshot):
+                logging.warning("Fast advance schedule aborted because the current screen is not a confirmed creative mode main screen")
+                return False
             match = self.find_advance_schedule_button_in_screenshot(screenshot)
+            action_clicked = False
             if not match:
                 match = self.click_named_button_in_region(
                     MAIN_SCREEN_BUTTONS,
@@ -3031,14 +3292,24 @@ class CreativeModeBot:
                     interval=0.10,
                     settle=0.45,
                 )
+                if match:
+                    action_clicked = True
                 if not match:
                     logging.warning("Fast path could not find advance schedule template in dedicated schedule ROI, using schedule hotspot fallback")
-                    self.click_advance_schedule_action(match=None, hotspot_variant=(attempt - 1) % len(MAIN_SCREEN_SCHEDULE_RATIOS), settle_between=0.14)
+                    action_clicked = self.click_advance_schedule_action(
+                        match=None,
+                        hotspot_variant=(attempt - 1) % len(MAIN_SCREEN_SCHEDULE_RATIOS),
+                        settle_between=0.14,
+                    )
                 else:
                     logging.info("Fast path matched advance schedule via dedicated ROI template: %s (score=%.3f)", match.name, match.score)
             else:
                 logging.info("Fast path matched advance schedule via dedicated ROI template: %s (score=%.3f)", match.name, match.score)
-                self.click_advance_schedule_action(match=match, settle_between=0.14)
+                action_clicked = self.click_advance_schedule_action(match=match, settle_between=0.14)
+
+            if not action_clicked:
+                logging.warning("Fast advance schedule action was skipped, aborting the current advance attempt")
+                return False
 
             self.last_advance_schedule_click_time = time.time()
             time.sleep(0.35)
@@ -3163,6 +3434,21 @@ class CreativeModeBot:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Football Club Champions creative mode automation")
     parser.add_argument("--process-name", default=PROCESS_NAME, help="Game process name")
+    parser.add_argument(
+        "--steam-game-id",
+        default=os.environ.get("SFCC_STEAM_GAME_ID", DEFAULT_STEAM_GAME_ID),
+        help="Steam app/game id used to build steam://rungameid/<id>",
+    )
+    parser.add_argument(
+        "--steam-launch-url",
+        default=os.environ.get("SFCC_STEAM_LAUNCH_URL", DEFAULT_STEAM_LAUNCH_URL),
+        help="Explicit Steam launch URL, for example steam://rungameid/<id>",
+    )
+    parser.add_argument(
+        "--game-exe-path",
+        default=os.environ.get("SFCC_GAME_EXE_PATH", ""),
+        help="Optional fallback path to the game executable when Steam URL launch is unavailable",
+    )
     parser.add_argument("--max-wait-after-schedule", type=float, default=180.0, help="Maximum seconds to wait for main screen return")
     parser.add_argument("--loop-interval", type=float, default=2.0, help="Seconds to wait between loop iterations")
     parser.add_argument("--main-threshold", type=float, default=0.82, help="Match threshold for main-screen buttons")
@@ -3277,12 +3563,16 @@ def main() -> int:
         templates.load(required_templates)
         window = GameWindow(args.process_name)
         vision = Vision(window, templates)
+        game_exe_path = Path(args.game_exe_path).expanduser() if args.game_exe_path else None
         bot = CreativeModeBot(
             vision=vision,
             window=window,
             main_threshold=args.main_threshold,
             button_threshold=args.button_threshold,
             dialog_threshold=args.dialog_threshold,
+            steam_game_id=args.steam_game_id,
+            steam_launch_url=args.steam_launch_url,
+            game_exe_path=game_exe_path,
         )
 
         if window.is_process_running():
