@@ -3,3 +3,5 @@ numpy
 mss
 psutil
 pywin32
+rapidocr
+onnxruntime

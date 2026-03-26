@@ -40,6 +40,3 @@ Thumbs.db
 
 # 状态文件
 sfcc_status.json
-
-# 图像模板文件
-templates/**/*.png
