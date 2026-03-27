@@ -38,6 +38,7 @@ LOG_DIR = BASE_DIR / "logs"
 PROCESS_NAME = "FootballClubChampions.exe"
 DEFAULT_STEAM_GAME_ID = "3271000"
 DEFAULT_STEAM_LAUNCH_URL = ""
+LOOP_EXCEPTION_RESTART_THRESHOLD = 5
 BOOTSTRAP_TO_MAIN_FASTLANE_SECONDS = 12.0
 POST_SAVE_SELECTION_ENTRY_FASTLANE_SECONDS = 20.0
 NEW_SEASON_FASTLANE_SECONDS = 18.0
@@ -199,7 +200,8 @@ ACTIONABLE_OPERATION_MARKERS = [
 OCR_TEXT_LEAGUE_RESULT = ("联赛结果",)
 OCR_TEXT_MATCH_REWARD = ("收支球迷", "收支·球迷")
 OCR_TEXT_CLUB_TRANSFERS = ("俱乐部转会",)
-OCR_TEXT_CLUB_TRANSFERS_LEVEL = ("选择联赛等级", "俱乐部转会")
+OCR_TEXT_CLUB_TRANSFERS_LEVEL = ("选择联赛等级",)
+OCR_TEXT_SPONSOR_SELECTION = ("选择赞助商",)
 OCR_TEXT_SP_JOIN = ("特殊球员加盟",)
 OCR_TEXT_FINAL_CONFIRM = ("最终确认",)
 OCR_TEXT_SAVE_SELECTION = ("保存数据一览",)
@@ -464,7 +466,11 @@ class GameWindow:
         y = max(1, min(rect["height"] - 1, int(rect["height"] * y_ratio)))
         screen_x, screen_y = win32gui.ClientToScreen(self.hwnd, (x, y))
         self.ensure_foreground()
-        win32api.SetCursorPos((screen_x, screen_y))
+        try:
+            win32api.SetCursorPos((screen_x, screen_y))
+        except Exception as exc:
+            logging.warning("Failed to move cursor to client position (%s, %s): %s", x, y, exc)
+            return
         logging.debug("Moved cursor to client position (%s, %s)", x, y)
         time.sleep(0.2)
 
@@ -877,6 +883,7 @@ class CreativeModeBot:
         self.last_visual_probe_time = 0.0
         self.last_visual_change_time = now
         self.last_visual_signature: np.ndarray | None = None
+        self._frame_eval_cache: dict[tuple[int, str, object], object] = {}
         self.common_flow = CommonFlow(self)
         self.bootstrap_flow = BootstrapFlow(self)
         self.main_flow = MainFlow(self)
@@ -901,6 +908,18 @@ class CreativeModeBot:
         if not available:
             return None
         return max(available, key=lambda item: item.score)
+
+    def _get_frame_cached(self, screenshot: np.ndarray, tag: str, extra: object = None) -> object | None:
+        return self._frame_eval_cache.get((id(screenshot), tag, extra))
+
+    def _has_frame_cached(self, screenshot: np.ndarray, tag: str, extra: object = None) -> bool:
+        return (id(screenshot), tag, extra) in self._frame_eval_cache
+
+    def _set_frame_cached(self, screenshot: np.ndarray, tag: str, value: object, extra: object = None) -> object:
+        if len(self._frame_eval_cache) >= 512:
+            self._frame_eval_cache.clear()
+        self._frame_eval_cache[(id(screenshot), tag, extra)] = value
+        return value
 
     def _match_probe(self, screenshot: np.ndarray, probe: ScreenProbe) -> MatchResult | None:
         region = probe.region or REGION_FULL
@@ -938,7 +957,12 @@ class CreativeModeBot:
         region: ScreenRegion = REGION_WIDE_TOP,
         min_score: float = 0.35,
     ) -> MatchResult | None:
-        return self.vision.find_text_in_region(screenshot, texts, region, min_score=min_score)
+        text_tuple = tuple(texts)
+        cache_key = (text_tuple, region.left_ratio, region.top_ratio, region.right_ratio, region.bottom_ratio, round(min_score, 3))
+        if self._has_frame_cached(screenshot, "ocr_title", cache_key):
+            return self._get_frame_cached(screenshot, "ocr_title", cache_key)  # type: ignore[return-value]
+        result = self.vision.find_text_in_region(screenshot, text_tuple, region, min_score=min_score)
+        return self._set_frame_cached(screenshot, "ocr_title", result, cache_key)  # type: ignore[return-value]
 
     def _candidate_steam_paths(self) -> list[Path]:
         candidates: list[Path] = []
@@ -1110,7 +1134,9 @@ class CreativeModeBot:
         return None
 
     def find_main_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
-        return self._match_screen_profile(
+        if self._has_frame_cached(screenshot, "main_screen"):
+            return self._get_frame_cached(screenshot, "main_screen")  # type: ignore[return-value]
+        result = self._match_screen_profile(
             screenshot,
             strong_probes=[
                 ScreenProbe(tuple(MAIN_SCREEN_BUTTONS), min(self.main_threshold, 0.55), REGION_SCHEDULE_BUTTON),
@@ -1119,6 +1145,7 @@ class CreativeModeBot:
             ],
             min_strong=1,
         )
+        return self._set_frame_cached(screenshot, "main_screen", result)  # type: ignore[return-value]
 
     def find_special_training_title_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
         return self._match_ocr_title(
@@ -1189,6 +1216,8 @@ class CreativeModeBot:
         return self.find_special_training_screen_in_screenshot(screenshot)
 
     def find_club_transfers_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
+        if self._has_frame_cached(screenshot, "club_transfers_screen"):
+            return self._get_frame_cached(screenshot, "club_transfers_screen")  # type: ignore[return-value]
         renewal_button = self.vision.match_best_in_region(
             screenshot,
             CLUB_TRANSFERS_RENEWAL_BUTTONS,
@@ -1196,7 +1225,7 @@ class CreativeModeBot:
             REGION_BOTTOM_RIGHT,
         )
         if not renewal_button:
-            return None
+            return self._set_frame_cached(screenshot, "club_transfers_screen", None)  # type: ignore[return-value]
 
         title = self._match_ocr_title(
             screenshot,
@@ -1210,14 +1239,16 @@ class CreativeModeBot:
             min_score=0.35,
         )
         if title:
-            return self._pick_best_match(title, renewal_button)
-        return None
+            return self._set_frame_cached(screenshot, "club_transfers_screen", self._pick_best_match(title, renewal_button))  # type: ignore[return-value]
+        return self._set_frame_cached(screenshot, "club_transfers_screen", None)  # type: ignore[return-value]
 
     def is_club_transfers_screen(self) -> MatchResult | None:
         screenshot = self.vision.capture()
         return self.find_club_transfers_screen_in_screenshot(screenshot)
 
     def find_club_transfers_level_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
+        if self._has_frame_cached(screenshot, "club_transfers_level_screen"):
+            return self._get_frame_cached(screenshot, "club_transfers_level_screen")  # type: ignore[return-value]
         title = self.find_club_transfers_level_title_in_screenshot(screenshot)
         min_button = self.vision.match_best_in_region(
             screenshot,
@@ -1230,24 +1261,27 @@ class CreativeModeBot:
             EXCEPTION_CONFIRM_BUTTONS + CONFIRM_BUTTONS,
             min(self.button_threshold, 0.68),
         )
+        result: MatchResult | None = None
         if title and min_button:
-            return self._pick_best_match(title, min_button, confirm_button)
-        if title and confirm_button:
-            return self._pick_best_match(title, confirm_button)
-        if min_button and confirm_button:
-            return self._pick_best_match(min_button, confirm_button)
-        if title:
-            return title
-        if min_button:
-            return min_button
-        return None
+            result = self._pick_best_match(title, min_button, confirm_button)
+        elif title and confirm_button:
+            result = self._pick_best_match(title, confirm_button)
+        elif min_button and confirm_button:
+            result = self._pick_best_match(min_button, confirm_button)
+        elif title:
+            result = title
+        elif min_button:
+            result = min_button
+        return self._set_frame_cached(screenshot, "club_transfers_level_screen", result)  # type: ignore[return-value]
 
     def is_club_transfers_level_screen(self) -> MatchResult | None:
         screenshot = self.vision.capture()
         return self.find_club_transfers_level_screen_in_screenshot(screenshot)
 
     def find_club_transfers_level_title_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
-        return self._match_ocr_title(
+        if self._has_frame_cached(screenshot, "club_transfers_level_title"):
+            return self._get_frame_cached(screenshot, "club_transfers_level_title")  # type: ignore[return-value]
+        result = self._match_ocr_title(
             screenshot,
             OCR_TEXT_CLUB_TRANSFERS_LEVEL,
             REGION_TOP_CENTER,
@@ -1258,6 +1292,7 @@ class CreativeModeBot:
             REGION_WIDE_TOP,
             min_score=0.35,
         )
+        return self._set_frame_cached(screenshot, "club_transfers_level_title", result)  # type: ignore[return-value]
 
     def find_club_transfers_min_button_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
         candidates = self.vision.match_all_in_region(
@@ -1286,6 +1321,8 @@ class CreativeModeBot:
         self.window.click_client(x, y, settle=settle)
 
     def find_sp_join_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
+        if self._has_frame_cached(screenshot, "sp_join_screen"):
+            return self._get_frame_cached(screenshot, "sp_join_screen")  # type: ignore[return-value]
         join_match = self.vision.match_best_in_region(
             screenshot,
             SP_JOIN_BUTTONS,
@@ -1306,31 +1343,74 @@ class CreativeModeBot:
             region=REGION_CENTER,
             max_matches=20,
         )
+        result: MatchResult | None = None
         if join_match and title_match:
-            return self._pick_best_match(join_match, title_match)
-        if filter_match and title_match:
-            return self._pick_best_match(filter_match, title_match)
-        if join_match and belong_matches:
-            return join_match
-        if filter_match and belong_matches:
-            return filter_match
-        if title_match and belong_matches:
-            return title_match
-        if join_match and filter_match:
-            return self._pick_best_match(join_match, filter_match)
-        return None
+            result = self._pick_best_match(join_match, title_match)
+        elif filter_match and title_match:
+            result = self._pick_best_match(filter_match, title_match)
+        elif join_match and belong_matches:
+            result = join_match
+        elif filter_match and belong_matches:
+            result = filter_match
+        elif title_match and belong_matches:
+            result = title_match
+        elif join_match and filter_match:
+            result = self._pick_best_match(join_match, filter_match)
+        return self._set_frame_cached(screenshot, "sp_join_screen", result)  # type: ignore[return-value]
 
     def is_sp_join_screen(self) -> MatchResult | None:
         screenshot = self.vision.capture()
         return self.find_sp_join_screen_in_screenshot(screenshot)
 
-    def find_final_confirm_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
-        return self.vision.match_best_in_region(
+    def find_sponsor_selection_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
+        if self._has_frame_cached(screenshot, "sponsor_selection_screen"):
+            return self._get_frame_cached(screenshot, "sponsor_selection_screen")  # type: ignore[return-value]
+        title = self._match_ocr_title(
+            screenshot,
+            OCR_TEXT_SPONSOR_SELECTION,
+            REGION_WIDE_TOP,
+            min_score=0.35,
+        ) or self._match_ocr_title(
+            screenshot,
+            OCR_TEXT_SPONSOR_SELECTION,
+            REGION_TOP_CENTER,
+            min_score=0.35,
+        )
+        confirm = self.vision.match_best_in_region(
             screenshot,
             FINAL_CONFIRM_BUTTONS,
             min(self.button_threshold, 0.72),
             REGION_BOTTOM_RIGHT,
         )
+        result = self._pick_best_match(title, confirm) if title and confirm else title
+        return self._set_frame_cached(screenshot, "sponsor_selection_screen", result)  # type: ignore[return-value]
+
+    def is_sponsor_selection_screen(self) -> MatchResult | None:
+        screenshot = self.vision.capture()
+        return self.find_sponsor_selection_screen_in_screenshot(screenshot)
+
+    def find_final_confirm_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
+        if self._has_frame_cached(screenshot, "final_confirm_screen"):
+            return self._get_frame_cached(screenshot, "final_confirm_screen")  # type: ignore[return-value]
+        title = self._match_ocr_title(
+            screenshot,
+            OCR_TEXT_FINAL_CONFIRM,
+            REGION_WIDE_TOP,
+            min_score=0.35,
+        ) or self._match_ocr_title(
+            screenshot,
+            OCR_TEXT_FINAL_CONFIRM,
+            REGION_TOP_CENTER,
+            min_score=0.35,
+        )
+        button = self.vision.match_best_in_region(
+            screenshot,
+            FINAL_CONFIRM_BUTTONS,
+            min(self.button_threshold, 0.72),
+            REGION_BOTTOM_RIGHT,
+        )
+        result = self._pick_best_match(title, button) if title and button else title
+        return self._set_frame_cached(screenshot, "final_confirm_screen", result)  # type: ignore[return-value]
 
     def is_final_confirm_screen(self) -> MatchResult | None:
         screenshot = self.vision.capture()
@@ -1341,32 +1421,40 @@ class CreativeModeBot:
         return self.find_login_screen_in_screenshot(screenshot)
 
     def find_login_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
-        return self._match_screen_profile(
+        if self._has_frame_cached(screenshot, "login_screen"):
+            return self._get_frame_cached(screenshot, "login_screen")  # type: ignore[return-value]
+        result = self._match_screen_profile(
             screenshot,
             strong_probes=[
                 ScreenProbe(tuple(LOGIN_SCREEN_LOGO_MARKERS), LOGIN_SCREEN_THRESHOLD, REGION_BOTTOM_LEFT),
             ],
             min_strong=1,
         )
+        return self._set_frame_cached(screenshot, "login_screen", result)  # type: ignore[return-value]
 
     def is_game_main_screen(self) -> MatchResult | None:
         screenshot = self.vision.capture()
         return self.find_game_main_screen_in_screenshot(screenshot)
 
     def find_game_main_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
-        return self._match_screen_profile(
+        if self._has_frame_cached(screenshot, "game_main_screen"):
+            return self._get_frame_cached(screenshot, "game_main_screen")  # type: ignore[return-value]
+        result = self._match_screen_profile(
             screenshot,
             strong_probes=[
                 ScreenProbe(tuple(GAME_MAIN_MARKERS), GAME_MAIN_MARK_THRESHOLD, REGION_BOTTOM_RIGHT),
             ],
             min_strong=1,
         )
+        return self._set_frame_cached(screenshot, "game_main_screen", result)  # type: ignore[return-value]
 
     def is_save_selection_screen(self) -> MatchResult | None:
         screenshot = self.vision.capture()
         return self.find_save_selection_screen_in_screenshot(screenshot)
 
     def find_save_selection_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
+        if self._has_frame_cached(screenshot, "save_selection_screen"):
+            return self._get_frame_cached(screenshot, "save_selection_screen")  # type: ignore[return-value]
         title = self._match_ocr_title(screenshot, OCR_TEXT_SAVE_SELECTION, REGION_TOP_CENTER, min_score=0.35)
         back_button = self.vision.match_best_in_region(
             screenshot,
@@ -1375,10 +1463,10 @@ class CreativeModeBot:
             REGION_TOP_LEFT,
         )
         if self.awaiting_save_selection and (title or back_button):
-            return title or back_button
+            return self._set_frame_cached(screenshot, "save_selection_screen", title or back_button)  # type: ignore[return-value]
         if title and back_button:
-            return title
-        return title
+            return self._set_frame_cached(screenshot, "save_selection_screen", title)  # type: ignore[return-value]
+        return self._set_frame_cached(screenshot, "save_selection_screen", title)  # type: ignore[return-value]
 
     def find_any_known_operation(self) -> MatchResult | None:
         screenshot = self.vision.capture()
@@ -1691,6 +1779,8 @@ class CreativeModeBot:
         )
 
     def detect_new_season_step_in_screenshot(self, screenshot: np.ndarray) -> str | None:
+        if self._has_frame_cached(screenshot, "new_season_step"):
+            return self._get_frame_cached(screenshot, "new_season_step")  # type: ignore[return-value]
         level_title = self.find_club_transfers_level_title_in_screenshot(screenshot)
         level_min_button = self.vision.match_best_in_region(
             screenshot,
@@ -1704,28 +1794,38 @@ class CreativeModeBot:
             min(self.button_threshold, 0.68),
         )
         if level_title or (level_min_button and level_confirm):
-            return "club_transfers_level"
+            return self._set_frame_cached(screenshot, "new_season_step", "club_transfers_level")  # type: ignore[return-value]
         if self.vision.match_best_in_region(
             screenshot,
             CLUB_TRANSFERS_RENEWAL_BUTTONS,
             min(self.button_threshold, 0.80),
             REGION_BOTTOM_RIGHT,
         ):
-            return "club_transfers"
+            return self._set_frame_cached(screenshot, "new_season_step", "club_transfers")  # type: ignore[return-value]
+        if self.find_sponsor_selection_screen_in_screenshot(screenshot):
+            return self._set_frame_cached(screenshot, "new_season_step", "sponsor_selection")  # type: ignore[return-value]
         if self.find_sp_join_screen_in_screenshot(screenshot):
-            return "sp_join"
-        if self.vision.match_best_in_region(
-            screenshot,
-            FINAL_CONFIRM_BUTTONS,
-            min(self.button_threshold, 0.72),
-            REGION_BOTTOM_RIGHT,
-        ):
-            return "final_confirm"
-        return None
+            return self._set_frame_cached(screenshot, "new_season_step", "sp_join")  # type: ignore[return-value]
+        if self.find_final_confirm_screen_in_screenshot(screenshot):
+            return self._set_frame_cached(screenshot, "new_season_step", "final_confirm")  # type: ignore[return-value]
+        return self._set_frame_cached(screenshot, "new_season_step", None)  # type: ignore[return-value]
+
+    def is_new_season_context_active_in_screenshot(self, screenshot: np.ndarray) -> bool:
+        if self.detect_new_season_step_in_screenshot(screenshot):
+            return True
+        if self.active_flow == "new_season" and time.time() - self.last_new_season_activity_time <= 60.0:
+            return True
+        return False
 
     def _secondary_button_exclusion_reason(self, screenshot: np.ndarray, button_name: str) -> str | None:
         if self.awaiting_save_selection and self.find_save_selection_screen_in_screenshot(screenshot):
             return "save selection screen is active"
+
+        if self.is_new_season_context_active_in_screenshot(screenshot):
+            if button_name in BACK_BUTTONS:
+                return "new-season flow owns ordered actions"
+            if button_name in [*CONFIRM_BUTTONS, *CONTINUE_BUTTONS, *SKIP_BUTTONS]:
+                return "new-season flow owns ordered actions"
 
         if self.find_special_training_screen_in_screenshot(screenshot):
             return "special training flow owns ordered actions"
@@ -1816,6 +1916,10 @@ class CreativeModeBot:
             logging.info("Exception layer detected new-season step %s, deferring to staged flow handling", new_season_step)
             return False
 
+        # Avoid story/event-choice false positives on obvious main screens.
+        if self.find_main_screen_in_screenshot(screenshot) or self.should_trust_main_screen(screenshot):
+            return False
+
         event_choice = self.find_event_choice_in_screenshot(screenshot)
         if event_choice:
             logging.info(
@@ -1830,6 +1934,10 @@ class CreativeModeBot:
         return False
 
     def _handle_emergency_buttons_from_screenshot(self, screenshot: np.ndarray, priority_threshold: float) -> bool:
+        if self.is_new_season_context_active_in_screenshot(screenshot):
+            logging.info("Deferring emergency buttons because new-season flow owns the current screen")
+            return False
+
         level_title = self.find_club_transfers_level_title_in_screenshot(screenshot)
         level_min_button = self.vision.match_best_in_region(
             screenshot,
@@ -1900,6 +2008,29 @@ class CreativeModeBot:
                 break
             handled_any = True
             screenshot = None
+        return handled_any
+
+    def handle_common_layers_once(self, screenshot: np.ndarray | None = None, max_clicks: int = 1) -> bool:
+        handled_any = False
+        priority_threshold = min(self.button_threshold, 0.72)
+        current_screenshot = screenshot
+        for attempt in range(max_clicks):
+            self.window.move_cursor_client(x_ratio=0.08, y_ratio=0.08)
+            if current_screenshot is None or attempt > 0:
+                current_screenshot = self.vision.capture()
+            if self._handle_emergency_buttons_from_screenshot(current_screenshot, priority_threshold):
+                handled_any = True
+                current_screenshot = None
+                continue
+            if self._handle_exception_layer_from_screenshot(current_screenshot, priority_threshold):
+                handled_any = True
+                current_screenshot = None
+                continue
+            if self._handle_global_priority_buttons_from_screenshot(current_screenshot, priority_threshold):
+                handled_any = True
+                current_screenshot = None
+                continue
+            break
         return handled_any
 
     def has_priority_button_visible(self) -> bool:
@@ -2772,6 +2903,8 @@ class CreativeModeBot:
         return handled
 
     def find_match_reward_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
+        if self._has_frame_cached(screenshot, "match_reward_screen"):
+            return self._get_frame_cached(screenshot, "match_reward_screen")  # type: ignore[return-value]
         title = self._match_ocr_title(screenshot, OCR_TEXT_MATCH_REWARD, REGION_WIDE_TOP, min_score=0.35)
         marker = self.vision.match_best_in_region(
             screenshot,
@@ -2779,7 +2912,7 @@ class CreativeModeBot:
             min(self.dialog_threshold, 0.60),
             REGION_CENTER,
         )
-        return self._pick_best_match(title, marker)
+        return self._set_frame_cached(screenshot, "match_reward_screen", self._pick_best_match(title, marker))  # type: ignore[return-value]
 
     def is_match_reward_screen(self) -> MatchResult | None:
         screenshot = self.vision.capture()
@@ -2941,17 +3074,40 @@ class CreativeModeBot:
         return False
 
     def try_enter_special_training_fast(self) -> bool:
+        transition_settle_seconds = 1.0
+        transition_wait_seconds = 4.0
         for attempt in range(1, 3):
             if not self.check_runtime_process_only():
                 return False
             screenshot = self.vision.capture()
+            title = self.find_special_training_title_in_screenshot(screenshot)
+            if title:
+                logging.info("Entered special training page via fast path: %s", title.name)
+                return True
+            special_training_screen = self.find_special_training_screen_in_screenshot(screenshot)
+            if special_training_screen:
+                logging.info(
+                    "Entered special training page via fast path screen markers: %s (score=%.3f)",
+                    special_training_screen.name,
+                    special_training_screen.score,
+                )
+                return True
+
             main_visible = self.find_main_screen_in_screenshot(screenshot)
             trusted_main = self.should_trust_main_screen(screenshot)
-            if not main_visible and not trusted_main and not self.is_confirmed_main_screen(screenshot):
+            confirmed_main = False
+            if not main_visible and not trusted_main:
+                confirmed_main = self.is_confirmed_main_screen(screenshot)
+
+            if not main_visible and not trusted_main and not confirmed_main:
                 logging.info("Fast path skipped special training entry because the current screen is not a confirmed creative mode main screen")
                 return False
-            if trusted_main and not main_visible:
+            elif trusted_main and not main_visible:
                 logging.info("Fast path trusted recent creative mode main-screen confirmation before special training entry")
+
+            if not (main_visible or trusted_main or confirmed_main):
+                continue
+
             match = self.find_special_training_entry_on_main_screen(screenshot)
             if not match:
                 logging.info("Fast path using special training hotspot fallback on attempt %s", attempt)
@@ -2959,14 +3115,40 @@ class CreativeModeBot:
             else:
                 logging.info("Fast path entering special training, attempt %s", attempt)
                 self.click_match(match, settle=0.5)
-            title = self.wait_for_special_training_title(
-                OCR_TEXT_SPECIAL_TRAINING_SETTINGS + OCR_TEXT_SPECIAL_TRAINING_RESULT,
-                timeout=0.9,
-                interval=0.12,
-            )
-            if title:
-                logging.info("Entered special training page via fast path: %s", title.name)
-                return True
+
+            settle_deadline = time.time() + transition_settle_seconds
+            while time.time() < settle_deadline:
+                if not self.check_runtime_process_only():
+                    return False
+                time.sleep(0.1)
+
+            handoff_deadline = time.time() + transition_wait_seconds
+            while time.time() < handoff_deadline:
+                if not self.check_runtime_process_only():
+                    return False
+                handoff_screenshot = self.vision.capture()
+                title = self.find_special_training_title_in_screenshot(handoff_screenshot)
+                if title:
+                    logging.info("Entered special training page via fast path: %s", title.name)
+                    return True
+
+                special_training_screen = self.find_special_training_screen_in_screenshot(handoff_screenshot)
+                if special_training_screen:
+                    logging.info(
+                        "Entered special training page via fast path screen markers: %s (score=%.3f)",
+                        special_training_screen.name,
+                        special_training_screen.score,
+                    )
+                    return True
+
+                if self.find_main_screen_in_screenshot(handoff_screenshot):
+                    logging.info(
+                        "Fast path special training handoff returned to creative mode main screen after attempt %s",
+                        attempt,
+                    )
+                    break
+
+                time.sleep(0.12)
         logging.info("Fast path did not confirm special training settings after two attempts")
         return False
 
@@ -3192,6 +3374,11 @@ class CreativeModeBot:
                 handled = True
                 logging.info("Fast post-schedule skip detected on attempt %s", attempt)
                 self.click_match(skip_button, settle=0.1)
+                followup_screenshot = self.vision.capture()
+                if self.handle_story_dialog_fast(screenshot=followup_screenshot, attempts=3):
+                    continue
+                if self._handle_fast_story_transition_from_screenshot(followup_screenshot):
+                    continue
                 continue
 
             return handled
@@ -3213,104 +3400,172 @@ class CreativeModeBot:
             assume_main_visible=assume_main_visible,
         )
 
+    def _is_in_post_schedule_exception_fastlane(self) -> bool:
+        return (
+            self.last_advance_schedule_click_time > 0
+            and time.time() - self.last_advance_schedule_click_time <= POST_SCHEDULE_EXCEPTION_FASTLANE_SECONDS
+        )
+
+    def _dispatch_loop_start_fastlane(self, screenshot: np.ndarray, max_wait_seconds: float) -> bool | None:
+        in_post_schedule_exception_fastlane = self._is_in_post_schedule_exception_fastlane()
+
+        if time.time() - self.last_save_selection_click_time <= POST_SAVE_SELECTION_ENTRY_FASTLANE_SECONDS:
+            if self.handle_emergency_buttons(max_clicks=1, initial_screenshot=screenshot):
+                return True
+            if self.bootstrap_flow.matches(screenshot):
+                logging.info("Loop start is within the post-save-selection fast lane, continuing bootstrap handling")
+                return self.run_bootstrap_flow(handoff_main_wait_seconds=max_wait_seconds)
+            if self.main_flow.matches(screenshot):
+                logging.info("Loop start is within the post-save-selection fast lane, dispatching directly to main flow")
+                return self.main_flow.run(max_wait_seconds, screenshot=screenshot, assume_main_visible=True)
+            if self.new_season_flow.matches(screenshot):
+                self.set_active_flow("new_season")
+                logging.info("Loop start is within the post-save-selection fast lane, dispatching directly to new-season flow")
+                return self.new_season_flow.run(screenshot)
+
+        if time.time() - self.last_new_season_activity_time <= NEW_SEASON_FASTLANE_SECONDS:
+            sp_join_screen = self.find_sp_join_screen_in_screenshot(screenshot)
+            if sp_join_screen:
+                self.set_active_flow("new_season")
+                logging.info("Loop start is within the new-season fast lane and SP join is visible, dispatching immediately")
+                return self.new_season_flow.run(screenshot, fast_dispatch=True)
+            if self.new_season_flow.matches(screenshot):
+                self.set_active_flow("new_season")
+                logging.info("Loop start is within the new-season fast lane, dispatching directly to new-season flow")
+                return self.new_season_flow.run(screenshot)
+            if self.handle_emergency_buttons(max_clicks=1, initial_screenshot=screenshot):
+                return True
+
+        if time.time() - self.last_final_confirm_time <= SP_JOIN_POST_CONFIRM_FASTLANE_SECONDS:
+            sp_join_screen = self.find_sp_join_screen_in_screenshot(screenshot)
+            if sp_join_screen:
+                self.set_active_flow("new_season")
+                logging.info("Loop start is within the post-final-confirm SP join fast lane, dispatching immediately")
+                return self.new_season_flow.run(screenshot, fast_dispatch=True)
+
+        sp_join_screen = self.find_sp_join_screen_in_screenshot(screenshot)
+        if sp_join_screen:
+            self.set_active_flow("new_season")
+            logging.info("Loop start visibly shows SP join, dispatching before common flow")
+            return self.new_season_flow.run(screenshot, fast_dispatch=True)
+
+        if in_post_schedule_exception_fastlane:
+            if self.handle_post_schedule_events_fast(max_clicks=4):
+                return True
+            if self.find_match_reward_screen_in_screenshot(screenshot):
+                logging.info("Loop start is within the post-schedule exception fast lane and match reward is visible")
+                return self.handle_match_reward_screen()
+
+        return None
+
+    def _dispatch_stage(
+        self,
+        screenshot: np.ndarray,
+        max_wait_seconds: float,
+        *,
+        stage_prefix: str,
+        allow_bootstrap_to_main_fastlane: bool,
+        allow_post_schedule_main_guard: bool,
+    ) -> bool | None:
+        in_post_schedule_exception_fastlane = self._is_in_post_schedule_exception_fastlane()
+
+        if self.is_new_season_context_active_in_screenshot(screenshot):
+            sp_join_screen = self.find_sp_join_screen_in_screenshot(screenshot)
+            self.set_active_flow("new_season")
+            if sp_join_screen:
+                logging.info("%s is inside the active new-season context and SP join is visible, dispatching immediately", stage_prefix)
+                return self.new_season_flow.run(screenshot, fast_dispatch=True)
+            logging.info("%s is inside the active new-season context, dispatching directly to new-season flow", stage_prefix)
+            return self.new_season_flow.run(screenshot, fast_dispatch=True)
+
+        if allow_bootstrap_to_main_fastlane and time.time() - self.last_bootstrap_to_main_time <= BOOTSTRAP_TO_MAIN_FASTLANE_SECONDS:
+            main_visible = self.find_main_screen_in_screenshot(screenshot)
+            if self.main_flow.matches(screenshot) and (main_visible or not in_post_schedule_exception_fastlane):
+                logging.info("%s is within the bootstrap-to-main fast lane, dispatching directly to main flow", stage_prefix)
+                return self.main_flow.run(max_wait_seconds, screenshot=screenshot, assume_main_visible=True)
+
+        if self.bootstrap_flow.matches(screenshot):
+            logging.info("%s belongs to the bootstrap layer", stage_prefix)
+            return self.run_bootstrap_flow(handoff_main_wait_seconds=max_wait_seconds)
+
+        main_visible = self.find_main_screen_in_screenshot(screenshot)
+        allow_main_dispatch = self.main_flow.matches(screenshot)
+        if allow_post_schedule_main_guard:
+            allow_main_dispatch = allow_main_dispatch and (main_visible or not in_post_schedule_exception_fastlane)
+        if allow_main_dispatch:
+            logging.info("%s belongs to the creative-mode main layer", stage_prefix)
+            logging.info("Dispatching %s directly into main_flow.run()", stage_prefix.lower())
+            result = self.main_flow.run(max_wait_seconds, screenshot=screenshot, assume_main_visible=True)
+            logging.info("main_flow.run() returned %s for %s", result, stage_prefix.lower())
+            return result
+
+        sp_join_screen = self.find_sp_join_screen_in_screenshot(screenshot)
+        if sp_join_screen:
+            self.set_active_flow("new_season")
+            logging.info("%s is visibly SP join, dispatching immediately to new-season flow", stage_prefix)
+            return self.new_season_flow.run(screenshot, fast_dispatch=True)
+
+        if self.new_season_flow.matches(screenshot):
+            self.set_active_flow("new_season")
+            logging.info("%s is already on a new-season step", stage_prefix)
+            return self.new_season_flow.run(screenshot)
+
+        if self.find_club_transfers_level_title_in_screenshot(screenshot):
+            self.set_active_flow("new_season")
+            logging.info("Club transfers level screen detected at %s", stage_prefix.lower())
+            return self.run_club_transfers_level_flow()
+
+        return None
+
+    def _dispatch_loop_start_by_stage(self, screenshot: np.ndarray, max_wait_seconds: float) -> bool | None:
+        return self._dispatch_stage(
+            screenshot,
+            max_wait_seconds,
+            stage_prefix="Loop start",
+            allow_bootstrap_to_main_fastlane=True,
+            allow_post_schedule_main_guard=True,
+        )
+
+    def _dispatch_current_stage(self, screenshot: np.ndarray, max_wait_seconds: float) -> bool | None:
+        return self._dispatch_stage(
+            screenshot,
+            max_wait_seconds,
+            stage_prefix="Current stage",
+            allow_bootstrap_to_main_fastlane=False,
+            allow_post_schedule_main_guard=False,
+        )
+
     def run_once(self, max_wait_seconds: float) -> bool:
         self.set_active_flow("generic")
         initial_screenshot: np.ndarray | None = None
         if self.check_runtime_process_only():
             initial_screenshot = self.vision.capture()
-            in_post_schedule_exception_fastlane = (
-                self.last_advance_schedule_click_time > 0
-                and time.time() - self.last_advance_schedule_click_time <= POST_SCHEDULE_EXCEPTION_FASTLANE_SECONDS
-            )
-            if time.time() - self.last_save_selection_click_time <= POST_SAVE_SELECTION_ENTRY_FASTLANE_SECONDS:
-                if self.handle_emergency_buttons(max_clicks=1, initial_screenshot=initial_screenshot):
-                    return True
-                if self.bootstrap_flow.matches(initial_screenshot):
-                    logging.info("Loop start is within the post-save-selection fast lane, continuing bootstrap handling")
-                    return self.run_bootstrap_flow(handoff_main_wait_seconds=max_wait_seconds)
-                if self.main_flow.matches(initial_screenshot):
-                    logging.info("Loop start is within the post-save-selection fast lane, dispatching directly to main flow")
-                    return self.main_flow.run(max_wait_seconds, screenshot=initial_screenshot, assume_main_visible=True)
-                if self.new_season_flow.matches(initial_screenshot):
-                    self.set_active_flow("new_season")
-                    logging.info("Loop start is within the post-save-selection fast lane, dispatching directly to new-season flow")
-                    return self.new_season_flow.run(initial_screenshot)
-            if time.time() - self.last_new_season_activity_time <= NEW_SEASON_FASTLANE_SECONDS:
-                if self.handle_emergency_buttons(max_clicks=1, initial_screenshot=initial_screenshot):
-                    return True
-                sp_join_screen = self.find_sp_join_screen_in_screenshot(initial_screenshot)
-                if sp_join_screen:
-                    self.set_active_flow("new_season")
-                    logging.info("Loop start is within the new-season fast lane and SP join is visible, dispatching immediately")
-                    return self.new_season_flow.run(initial_screenshot, fast_dispatch=True)
-                if self.new_season_flow.matches(initial_screenshot):
-                    self.set_active_flow("new_season")
-                    logging.info("Loop start is within the new-season fast lane, dispatching directly to new-season flow")
-                    return self.new_season_flow.run(initial_screenshot)
-            if time.time() - self.last_final_confirm_time <= SP_JOIN_POST_CONFIRM_FASTLANE_SECONDS:
-                sp_join_screen = self.find_sp_join_screen_in_screenshot(initial_screenshot)
-                if sp_join_screen:
-                    self.set_active_flow("new_season")
-                    logging.info("Loop start is within the post-final-confirm SP join fast lane, dispatching immediately")
-                    return self.new_season_flow.run(initial_screenshot, fast_dispatch=True)
-            sp_join_screen = self.find_sp_join_screen_in_screenshot(initial_screenshot)
-            if sp_join_screen:
+            fastlane_result = self._dispatch_loop_start_fastlane(initial_screenshot, max_wait_seconds)
+            if fastlane_result is not None:
+                return fastlane_result
+            if self.is_new_season_context_active_in_screenshot(initial_screenshot):
                 self.set_active_flow("new_season")
-                logging.info("Loop start visibly shows SP join, dispatching before common flow")
+                logging.info("Loop start is already inside the active new-season context, dispatching before common flow")
                 return self.new_season_flow.run(initial_screenshot, fast_dispatch=True)
-            if in_post_schedule_exception_fastlane:
-                if self.handle_post_schedule_events_fast(max_clicks=4):
-                    return True
-                if self.find_match_reward_screen_in_screenshot(initial_screenshot):
-                    logging.info("Loop start is within the post-schedule exception fast lane and match reward is visible")
-                    return self.handle_match_reward_screen()
+            if self.find_main_screen_in_screenshot(initial_screenshot):
+                logging.info("Loop start strongly confirms the creative-mode main screen, dispatching before common flow")
+                stage_result = self._dispatch_loop_start_by_stage(initial_screenshot, max_wait_seconds)
+                if stage_result is not None:
+                    return stage_result
             if self.common_flow.run_once(initial_screenshot, max_clicks=1):
                 return True
-            if time.time() - self.last_bootstrap_to_main_time <= BOOTSTRAP_TO_MAIN_FASTLANE_SECONDS:
-                main_visible = self.find_main_screen_in_screenshot(initial_screenshot)
-                if self.main_flow.matches(initial_screenshot) and (main_visible or not in_post_schedule_exception_fastlane):
-                    logging.info("Loop start is within the bootstrap-to-main fast lane, dispatching directly to main flow")
-                    return self.main_flow.run(max_wait_seconds, screenshot=initial_screenshot, assume_main_visible=True)
-            if self.bootstrap_flow.matches(initial_screenshot):
-                logging.info("Loop start belongs to the bootstrap layer")
-                return self.run_bootstrap_flow(handoff_main_wait_seconds=max_wait_seconds)
-            main_visible = self.find_main_screen_in_screenshot(initial_screenshot)
-            if self.main_flow.matches(initial_screenshot) and (main_visible or not in_post_schedule_exception_fastlane):
-                logging.info("Loop start belongs to the creative-mode main layer")
-                logging.info("Dispatching loop start directly into main_flow.run()")
-                result = self.main_flow.run(max_wait_seconds, screenshot=initial_screenshot, assume_main_visible=True)
-                logging.info("main_flow.run() returned %s at loop start", result)
-                return result
-            if self.new_season_flow.matches(initial_screenshot):
-                self.set_active_flow("new_season")
-                logging.info("Loop start is already on a new-season step")
-                return self.new_season_flow.run(initial_screenshot)
-            if self.find_club_transfers_level_title_in_screenshot(initial_screenshot):
-                self.set_active_flow("new_season")
-                logging.info("Club transfers level screen detected at loop start")
-                return self.run_club_transfers_level_flow()
+            stage_result = self._dispatch_loop_start_by_stage(initial_screenshot, max_wait_seconds)
+            if stage_result is not None:
+                return stage_result
         if not self.check_runtime_health():
             return False
         if self.common_flow.run_once(max_clicks=4):
             return True
 
         screenshot = self.vision.capture()
-        if self.bootstrap_flow.matches(screenshot):
-            logging.info("Current stage belongs to the bootstrap layer, handling startup navigation")
-            return self.run_bootstrap_flow(handoff_main_wait_seconds=max_wait_seconds)
-        if self.main_flow.matches(screenshot):
-            logging.info("Current stage belongs to the creative-mode main layer")
-            logging.info("Dispatching current stage directly into main_flow.run()")
-            result = self.main_flow.run(max_wait_seconds, screenshot=screenshot, assume_main_visible=True)
-            logging.info("main_flow.run() returned %s for current-stage dispatch", result)
-            return result
-        sp_join_screen = self.find_sp_join_screen_in_screenshot(screenshot)
-        if sp_join_screen:
-            self.set_active_flow("new_season")
-            logging.info("Current stage is visibly SP join, dispatching immediately to new-season flow")
-            return self.new_season_flow.run(screenshot, fast_dispatch=True)
-        if self.new_season_flow.matches(screenshot) and self.new_season_flow.run(screenshot):
-            return True
+        current_stage_result = self._dispatch_current_stage(screenshot, max_wait_seconds)
+        if current_stage_result is not None:
+            return current_stage_result
         if self.common_flow.handle_exception(screenshot=screenshot, max_clicks=1):
             return True
 
@@ -3414,6 +3669,7 @@ def main() -> int:
                 time.sleep(10.0)
 
         iteration = 1
+        consecutive_loop_exceptions = 0
         while True:
             try:
                 if bot.restart_requested:
@@ -3435,6 +3691,7 @@ def main() -> int:
                     logging.info("Loop iteration %s completed successfully", iteration)
                 else:
                     logging.warning("Loop iteration %s did not complete successfully, continuing", iteration)
+                consecutive_loop_exceptions = 0
                 iteration += 1
                 time.sleep(max(0.5, args.loop_interval))
             except Exception as loop_exc:
@@ -3444,6 +3701,15 @@ def main() -> int:
                     except Exception:
                         logging.exception("Failed to save screenshot after loop exception")
                 logging.exception("Unhandled exception inside loop iteration %s: %s", iteration, loop_exc)
+                consecutive_loop_exceptions += 1
+                if consecutive_loop_exceptions >= LOOP_EXCEPTION_RESTART_THRESHOLD:
+                    reason = f"{consecutive_loop_exceptions} consecutive loop exceptions"
+                    logging.error("Restart requested after repeated loop exceptions: %s", reason)
+                    bot.request_restart(reason)
+                    if not bot.restart_game(bot.restart_reason or reason):
+                        logging.error("Restart after repeated loop exceptions failed; will retry after a short pause")
+                        time.sleep(10.0)
+                    consecutive_loop_exceptions = 0
                 iteration += 1
                 time.sleep(max(1.0, args.loop_interval))
     except Exception as exc:

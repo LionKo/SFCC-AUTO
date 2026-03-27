@@ -11,8 +11,43 @@ class BootstrapFlow:
     def __init__(self, bot: object) -> None:
         self.bot = bot
 
+    def _detect_post_save_new_season_step(self, screenshot):
+        if self.bot.find_club_transfers_screen_in_screenshot(screenshot):
+            return "club_transfers"
+        if self.bot.find_club_transfers_level_screen_in_screenshot(screenshot):
+            return "club_transfers_level"
+        if self.bot.find_sponsor_selection_screen_in_screenshot(screenshot):
+            return "sponsor_selection"
+        if self.bot.find_sp_join_screen_in_screenshot(screenshot):
+            return "sp_join"
+        if self.bot.find_final_confirm_screen_in_screenshot(screenshot):
+            return "final_confirm"
+        return self.bot.detect_new_season_step_in_screenshot(screenshot)
+
+    def _is_post_save_main_intermediate(self, screenshot) -> bool:
+        if self.bot.find_match_reward_screen_in_screenshot(screenshot):
+            return True
+        if self.bot.vision.match_best_in_region(
+            screenshot,
+            ["log", "log2"],
+            min(self.bot.button_threshold, self.bot.dialog_threshold, 0.72),
+            self.bot.REGION_TOP_RIGHT,
+        ):
+            return True
+        if self.bot.vision.match_best(
+            screenshot,
+            self.bot.CONTINUE_BUTTONS + self.bot.CONFIRM_BUTTONS + self.bot.SKIP_BUTTONS,
+            min(self.bot.button_threshold, 0.72),
+        ):
+            return True
+        return False
+
     def matches(self, screenshot) -> bool:
         if self.bot.awaiting_main_after_save_selection and self.bot.find_main_screen_in_screenshot(screenshot):
+            return True
+        if self.bot.awaiting_main_after_save_selection and self._detect_post_save_new_season_step(screenshot):
+            return True
+        if self.bot.awaiting_main_after_save_selection and self._is_post_save_main_intermediate(screenshot):
             return True
         if self.bot.awaiting_main_after_save_selection:
             return False
@@ -43,8 +78,6 @@ class BootstrapFlow:
                 else 0.0
             )
             login_cooldown_active = 0.0 < post_login_wait < post_login_cooldown_seconds
-            if self.bot.handle_global_priority_buttons(max_clicks=1, initial_screenshot=screenshot):
-                continue
 
             if self.bot.awaiting_save_selection and self.bot.find_main_screen_in_screenshot(screenshot):
                 self.bot.set_active_flow("main")
@@ -61,6 +94,16 @@ class BootstrapFlow:
                     if self.bot.last_save_selection_click_time > 0
                     else 0.0
                 )
+                new_season_step = self._detect_post_save_new_season_step(screenshot)
+                if new_season_step:
+                    self.bot.awaiting_main_after_save_selection = False
+                    self.bot.last_bootstrap_login_click_time = 0.0
+                    self.bot.set_active_flow("new_season")
+                    logging.info(
+                        "Bootstrap handoff detected new-season step %s after save selection, dispatching directly",
+                        new_season_step,
+                    )
+                    return self.bot.new_season_flow.run_step(new_season_step, screenshot=screenshot, fast_dispatch=True)
                 if self.bot.find_main_screen_in_screenshot(screenshot):
                     self.bot.set_active_flow("main")
                     self.bot.awaiting_main_after_save_selection = False
@@ -75,15 +118,25 @@ class BootstrapFlow:
                             assume_main_visible=True,
                         )
                     return True
+                if self._is_post_save_main_intermediate(screenshot):
+                    self.bot.awaiting_main_after_save_selection = False
+                    self.bot.last_bootstrap_login_click_time = 0.0
+                    self.bot.set_active_flow("main")
+                    logging.info("Bootstrap handoff detected a main-chain intermediate screen after save selection, dispatching directly")
+                    return self.bot.main_flow.wait_for_main_screen_return(
+                        handoff_main_wait_seconds if handoff_main_wait_seconds is not None else timeout_seconds
+                    )
                 if handoff_wait >= SAVE_SELECTION_MAIN_HANDOFF_TIMEOUT_SECONDS:
                     logging.warning(
-                        "Timed out after %.1fs waiting for creative mode main screen after save selection; clearing the handoff state and resuming normal bootstrap detection",
+                        "Still waiting %.1fs after save selection; bootstrap remains in the save-selection handoff state and will keep watching for creative mode main, new-season, or main-chain intermediate screens",
                         handoff_wait,
                     )
-                    self.bot.awaiting_main_after_save_selection = False
-                    continue
-                logging.info("Waiting for creative mode main screen after save selection, skipping login/game-main checks")
+                else:
+                    logging.info("Waiting for creative mode main, new-season, or main-chain handoff after save selection")
                 time.sleep(0.8)
+                continue
+
+            if self.bot.handle_global_priority_buttons(max_clicks=1, initial_screenshot=screenshot):
                 continue
 
             game_main = self.bot.find_game_main_screen_in_screenshot(screenshot)
