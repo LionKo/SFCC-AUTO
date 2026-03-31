@@ -10,6 +10,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+try:
+    import winreg
+except Exception:  # pragma: no cover - Windows-only dependency
+    winreg = None
 
 BASE_DIR = Path(__file__).resolve().parent
 if os.name == "nt":
@@ -20,6 +24,11 @@ if os.name == "nt":
     if hasattr(os, "add_dll_directory") and venv_dll_dir.exists():
         os.add_dll_directory(str(venv_dll_dir))
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import cv2
 import numpy as np
 import psutil
@@ -29,12 +38,30 @@ import win32gui
 import win32process
 import win32ui
 
+from stages import (
+    LoginStageController,
+    RunContext,
+    SceneSnapshot,
+    StageName,
+    StageResult,
+    WorldLeagueStageController,
+    current_sub_stage,
+    reset_to_login,
+    write_status,
+)
+
 # =========================
-# 鍩虹閰嶇疆
+# 基础配置
 # =========================
 PROCESS_NAME = "FootballClubChampions"
-STATUS_FILE = BASE_DIR / "sfcc_status.json"
-GAME_EXE_PATH = Path(r"D:\Program Files (x86)\Steam\steamapps\common\SegaFCC\FootballClubChampions.exe")
+ASSETS_DIR = BASE_DIR / "assets"
+TEMPLATES_DIR = ASSETS_DIR / "templates"
+RUNTIME_DIR = BASE_DIR / "runtime"
+STATUS_FILE = RUNTIME_DIR / "sfcc_status.json"
+CAPTURE_DIR = RUNTIME_DIR / "captures"
+STEAM_APP_ID = "3271000"
+GAME_INSTALL_DIR_NAME = "SegaFCC"
+GAME_EXE_NAME = "FootballClubChampions.exe"
 
 DEBUG_SAVE = True
 DEBUG_ANNOTATE = True
@@ -61,16 +88,17 @@ PRACTICE_STALL_RESTART_SECONDS = 120.0
 
 PRACTICE_CLICK_LIMIT = 10000
 SHUTDOWN_DELAY_SECONDS = 15
-RUNTIME_LOG_DIR = BASE_DIR / "logs"
+RUNTIME_LOG_DIR = RUNTIME_DIR / "logs"
 LOG_CLEANUP_INTERVAL_SECONDS = 3600.0
 
 # =========================
-# 瀵艰埅绛栫暐锛堢涓€鎬у師鐞嗭細鐘舵€佹満 + 鍥哄畾鍏ュ彛鐐癸級
-# 璇存槑锛氭ā鏉?鏂囧瓧閮戒笉閫傚悎杩欎釜鍔ㄦ€?UI銆傝繘鍏ヨ仈璧涘墠鐨?3 姝ユ湰璐ㄦ槸鏈夐檺鐘舵€佸鑸紝
-# 鐩存帴鐐光€滅ǔ瀹氬叆鍙ｅ尯鍩熲€濇瘮缁х画鎶樿吘鏁村崱鐗囨ā鏉挎洿绋炽€?# =========================
-BOOT_TEMPLATE_PATH = BASE_DIR / "template_boot_sega2026.png"
-WORLD_PREM_TEMPLATE_PATH = BASE_DIR / "template_world_premiership_entry.png"
-SAVE_LIST_TEMPLATE_PATH = BASE_DIR / "template_save_list_title.png"
+# 导航策略（核心原则：状态机 + 固定入口点）
+# 说明：模板文字并不总适合这个动态 UI。进入联赛前的若干步骤本质上是有限状态导航，
+# 直接点击“稳定入口区域”通常比继续折腾复杂模板更稳。
+BOOT_TEMPLATE_PATH = TEMPLATES_DIR / "template_boot_sega2026.png"
+WORLD_PREM_TEMPLATE_PATH = TEMPLATES_DIR / "template_world_premiership_entry.png"
+SAVE_LIST_TEMPLATE_PATH = TEMPLATES_DIR / "template_save_list_title.png"
+CHANGE_TEAM_TEMPLATE_PATH = TEMPLATES_DIR / "change_team.png"
 BOOT_THRESHOLD = 0.56
 WORLD_PREM_THRESHOLD = 0.56
 SAVE_LIST_TITLE_THRESHOLD = 0.62
@@ -86,8 +114,8 @@ WORLD_PREM_CLICK_RATIO = (0.455, 0.585)
 NAV_CLICK_COOLDOWN = 3.5
 NAV_STEP_TIMEOUT = 12.0
 DREAM_TEAM_TEMPLATE_PATHS = [
-    BASE_DIR / "template_dream_team_mode.png",
-    BASE_DIR / "template_dream_team_mode_v2.png",
+    TEMPLATES_DIR / "template_dream_team_mode.png",
+    TEMPLATES_DIR / "template_dream_team_mode_v2.png",
 ]
 DREAM_TEAM_TEMPLATE_THRESHOLD = 0.58
 # Only use the template as a gate inside the upper-card area.
@@ -105,9 +133,16 @@ BACK_BUTTON_HINT_RATIO = 0.025
 HOME_FALLBACK_MAX_ACTION_SCORE = 0.74
 HOME_FALLBACK_MAX_BOOT_SCORE = 0.35
 SAVE_LIST_ACTION_MAX_SCORE = 0.55
+CHANGE_TEAM_THRESHOLD = 0.60
+CHANGE_TEAM_TEMPLATE_ROIS = [
+    (0.00, 0.28, 0.16, 0.78),
+    (0.84, 0.28, 1.00, 0.78),
+]
+TEAM_LIST_SCROLL_START_RATIO = (0.50, 0.46)
+TEAM_LIST_SCROLL_END_RATIO = (0.50, 0.82)
 
 # =========================
-# 鍙充笅鍔ㄤ綔鎸夐挳璇嗗埆
+# 右下动作按钮识别
 # =========================
 GLOBAL_ROI = dict(x1=0.60, y1=0.64, x2=1.00, y2=0.98)
 BUTTON_CONFIG = {
@@ -135,9 +170,9 @@ BUTTON_CONFIG = {
 }
 
 TEMPLATE_PATHS = {
-    "continue": BASE_DIR / "template_continue.png",
-    "practice": BASE_DIR / "template_practice.png",
-    "view_result": BASE_DIR / "template_view_result.png",
+    "continue": TEMPLATES_DIR / "template_continue.png",
+    "practice": TEMPLATES_DIR / "template_practice.png",
+    "view_result": TEMPLATES_DIR / "template_view_result.png",
 }
 
 TEAM_CHANGE_TOP_SCROLL_DRAGS = 3
@@ -149,13 +184,17 @@ TEAM_SELECT_OPEN_WAIT_SECONDS = 1.4
 class StatusWriter:
     def __init__(self, path: Path):
         self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.last_write = 0.0
         self.data = {
             "ts": time.time(),
             "state": "starting",
+            "stage": "login",
+            "sub_stage": "idle",
             "practice_click_count": 0,
             "last_action": "",
             "last_button": "",
+            "restart_reason": "",
         }
 
     def update(self, force: bool = False, **kwargs) -> None:
@@ -177,7 +216,7 @@ class RuntimeLogger:
         self.session_stamp = stamp
         self.log_path = self.base_dir / f"sfcc_run_{stamp}.log"
         self.latest_path = self.base_dir / "sfcc_latest.log"
-        self.snapshot_dir = self.base_dir / f"debug_{stamp}"
+        self.snapshot_dir = self.base_dir / "debug" / stamp
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         self.last_cleanup_at = 0.0
         self._write_raw(f"# session_start {stamp}")
@@ -201,7 +240,7 @@ class RuntimeLogger:
     def archive_debug_images(self, tag: str) -> None:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         for src_name in ("last_capture.png", "last_debug.png"):
-            src = BASE_DIR / src_name
+            src = CAPTURE_DIR / src_name
             if not src.exists():
                 continue
             dst = self.snapshot_dir / f"{stamp}_{tag}_{src_name}"
@@ -431,10 +470,10 @@ def capture_window_client(hwnd: int):
 
 def load_template(path: Path):
     if not path.exists():
-        raise FileNotFoundError(f"妯℃澘涓嶅瓨鍦? {path}")
+        raise FileNotFoundError(f"模板不存在: {path}")
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
-        raise RuntimeError(f"鏃犳硶璇诲彇妯℃澘: {path}")
+        raise RuntimeError(f"无法读取模板: {path}")
     return img
 
 
@@ -576,8 +615,12 @@ def match_scene(frame_bgr, template_bgr, roi=None):
 
 
 def detect_blue_popup_button(frame_bgr):
-    """璇嗗埆寮圭獥涓嬫柟钃濊壊鎸夐挳銆傚師鐞嗭細
-    1) 闄愬埗鍦ㄤ腑涓嬪尯鍩燂紱2) 鎸?HSV 鎵鹃潚钃濇寜閽紱3) 鎵炬í鍚戠煩褰紱4) 浼樺厛搴曢儴灞呬腑鐨勫ぇ鎸夐挳銆?    """
+    """识别弹窗下方蓝色按钮。
+    1) 限制在中下区域
+    2) 按 HSV 找青蓝按钮
+    3) 查找横向矩形
+    4) 优先底部居中的大按钮
+    """
     h, w = frame_bgr.shape[:2]
     y1 = int(h * 0.58)
     y2 = int(h * 0.95)
@@ -605,7 +648,7 @@ def detect_blue_popup_button(frame_bgr):
             continue
         cx = x + cw / 2
         cy = y + ch / 2
-        # 涓嬫柟灞呬腑浼樺厛
+        # 底部居中优先
         center_score = 1.0 - min(abs((cx / roi.shape[1]) - 0.5) / 0.5, 1.0)
         bottom_score = min((cy / roi.shape[0]), 1.0)
         fill_ratio = cv2.contourArea(cnt) / max(area, 1)
@@ -692,15 +735,84 @@ def detect_top_left_back_button(frame_bgr) -> float:
     return mask_ratio(cyan_mask)
 
 
+def iter_steam_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+
+    def add(path_str: str | None) -> None:
+        if not path_str:
+            return
+        path = Path(path_str)
+        key = str(path).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(path)
+
+    add(os.environ.get("STEAM_HOME"))
+    add(os.environ.get("STEAM_PATH"))
+    add(r"C:\Program Files (x86)\Steam")
+    add(r"C:\Program Files\Steam")
+    add(r"D:\Program Files (x86)\Steam")
+    add(r"D:\Program Files\Steam")
+
+    if winreg is not None and os.name == "nt":
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for subkey in (
+                r"Software\Valve\Steam",
+                r"Software\WOW6432Node\Valve\Steam",
+            ):
+                try:
+                    with winreg.OpenKey(hive, subkey) as key:
+                        install_path, _ = winreg.QueryValueEx(key, "SteamPath")
+                        add(install_path)
+                except OSError:
+                    pass
+
+    return roots
+
+
+def find_game_exe() -> Path | None:
+    env_path = os.environ.get("SFCC_GAME_EXE")
+    if env_path:
+        env_exe = Path(env_path)
+        if env_exe.exists():
+            return env_exe
+
+    for steam_root in iter_steam_roots():
+        steamapps_dir = steam_root / "steamapps"
+        manifest_path = steamapps_dir / f"appmanifest_{STEAM_APP_ID}.acf"
+        if manifest_path.exists():
+            candidate = steamapps_dir / "common" / GAME_INSTALL_DIR_NAME / GAME_EXE_NAME
+            if candidate.exists():
+                return candidate
+
+        common_dir = steamapps_dir / "common" / GAME_INSTALL_DIR_NAME
+        candidate = common_dir / GAME_EXE_NAME
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
 def try_launch_game(last_launch_at: float):
     now = time.time()
     if now - last_launch_at < GAME_LAUNCH_RETRY_SECONDS:
         return False, last_launch_at, f"Launch throttled, wait {GAME_LAUNCH_RETRY_SECONDS:.0f}s before retry"
-    if not GAME_EXE_PATH.exists():
-        return False, last_launch_at, f"Game executable not found: {GAME_EXE_PATH}"
+
+    if os.name == "nt":
+        try:
+            os.startfile(f"steam://rungameid/{STEAM_APP_ID}")
+            return True, now, f"Game launched via Steam appid={STEAM_APP_ID}"
+        except Exception:
+            pass
+
+    game_exe_path = find_game_exe()
+    if game_exe_path is None:
+        return False, last_launch_at, f"Game not found. Set SFCC_GAME_EXE or install via Steam appid={STEAM_APP_ID}"
     try:
-        subprocess.Popen([str(GAME_EXE_PATH)], cwd=str(GAME_EXE_PATH.parent))
-        return True, now, f"Game launched: {GAME_EXE_PATH}"
+        subprocess.Popen([str(game_exe_path)], cwd=str(game_exe_path.parent))
+        return True, now, f"Game launched from exe: {game_exe_path}"
     except Exception as e:
         return False, last_launch_at, f"Game launch failed: {e}"
 
@@ -711,7 +823,7 @@ def do_foreground_click(hwnd: int, client_x: int, client_y: int):
     old_fg = win32gui.GetForegroundWindow()
     ok = force_foreground_window(hwnd)
     if not ok:
-        return False, "鍓嶅彴鍒囨崲澶辫触"
+        return False, "前台切换失败"
     time.sleep(0.03)
     win32api.SetCursorPos((screen_x, screen_y))
     time.sleep(0.02)
@@ -924,6 +1036,27 @@ def detect_team_select_scene(frame_bgr):
     }
 
 
+def detect_change_team_button(frame_bgr, change_team_template):
+    best = None
+    for roi in CHANGE_TEAM_TEMPLATE_ROIS:
+        score, scale, loc, size = match_scene(frame_bgr, change_team_template, roi=roi)
+        if loc is None or size is None:
+            continue
+        if best is None or score > best["score"]:
+            x, y = loc
+            w, h = size
+            best = {
+                "found": score >= CHANGE_TEAM_THRESHOLD,
+                "score": float(score),
+                "scale": scale,
+                "bbox": (x, y, w, h),
+                "click_point": (int(x + w * 0.5), int(y + h * 0.5)),
+            }
+    if best is None:
+        return None
+    return best
+
+
 def detect_training_select_scene(frame_bgr):
     h, w = frame_bgr.shape[:2]
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
@@ -947,7 +1080,8 @@ def detect_training_select_scene(frame_bgr):
 def save_debug(frame, results=None, popup=None, dream_team=None, note=""):
     if not DEBUG_SAVE:
         return
-    raw_path = BASE_DIR / 'last_capture.png'
+    CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    raw_path = CAPTURE_DIR / 'last_capture.png'
     cv2.imwrite(str(raw_path), frame)
     if not DEBUG_ANNOTATE:
         return
@@ -978,7 +1112,99 @@ def save_debug(frame, results=None, popup=None, dream_team=None, note=""):
             cv2.circle(vis, pt, 6, color, -1)
     if note:
         cv2.putText(vis, note, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-    cv2.imwrite(str(BASE_DIR / 'last_debug.png'), vis)
+    cv2.imwrite(str(CAPTURE_DIR / 'last_debug.png'), vis)
+
+
+def build_scene_snapshot(
+    frame,
+    now: float,
+    action_templates: dict,
+    boot_template,
+    world_prem_template,
+    save_list_template,
+    change_team_template,
+    dream_team_templates,
+    practice_click_count: int,
+) -> SceneSnapshot:
+    hits, results = detect_buttons(frame, action_templates)
+    popup = detect_blue_popup_button(frame)
+    boot_score, boot_scale, _, _ = detect_boot_scene(frame, boot_template)
+    world_prem_score, world_prem_scale, _, _ = detect_world_prem_scene(frame, world_prem_template)
+    dream_team = detect_dream_team_scene(frame, dream_team_templates) if dream_team_templates else None
+    team_change = detect_change_team_button(frame, change_team_template)
+    team_select = detect_team_select_scene(frame)
+    back_button_ratio = detect_top_left_back_button(frame)
+    max_action_score = max(results[name]["score"] for name in ("continue", "practice", "view_result"))
+    save_list_info = detect_save_list_scene(frame, save_list_template, max_action_score, popup, boot_score)
+    save_list_like = save_list_info["found"]
+
+    if not hits and not save_list_like and back_button_ratio >= BACK_BUTTON_HINT_RATIO:
+        best_name = max(("continue", "practice", "view_result"), key=lambda name: results[name]["score"])
+        best_result = results[best_name]
+        if best_result["score"] >= LOW_CONF_ACTION_ACCEPT_SCORE and best_result.get("click_point") is not None:
+            hits.append((
+                best_name,
+                best_result["score"],
+                best_result["click_point"],
+                best_result["scale"],
+                BUTTON_CONFIG[best_name]["priority"],
+            ))
+
+    fallback_home_like = (
+        not save_list_like
+        and max_action_score < HOME_FALLBACK_MAX_ACTION_SCORE
+        and boot_score < HOME_FALLBACK_MAX_BOOT_SCORE
+        and (not popup or popup.get("score", -1.0) < POPUP_ACCEPT_SCORE)
+        and not (team_change and team_change.get("found"))
+        and not team_select.get("found")
+    )
+    navigation_bootstrap_active = practice_click_count == 0 and max_action_score < ACTION_BUTTON_ACCEPT_SCORE
+    home_like = bool(
+        navigation_bootstrap_active
+        and (
+            (dream_team and dream_team.get("score", -1.0) >= HOME_SCENE_DREAM_SCORE and world_prem_score < WORLD_PREM_THRESHOLD)
+            or fallback_home_like
+        )
+    )
+    operable_scene = bool(
+        hits
+        or (popup and popup.get("score", -1.0) >= POPUP_ACCEPT_SCORE)
+        or boot_score >= BOOT_THRESHOLD
+        or home_like
+        or save_list_like
+        or world_prem_score >= WORLD_PREM_THRESHOLD
+        or team_select.get("found")
+    )
+    world_league_ready = bool(
+        hits
+        or (popup and popup.get("score", -1.0) >= POPUP_ACCEPT_SCORE and boot_score < BOOT_THRESHOLD)
+        or team_select.get("found")
+    )
+
+    return SceneSnapshot(
+        now=now,
+        pid=0,
+        hwnd=0,
+        frame=frame,
+        hits=hits,
+        results=results,
+        popup=popup,
+        boot_score=boot_score,
+        boot_scale=boot_scale,
+        world_prem_score=world_prem_score,
+        world_prem_scale=world_prem_scale,
+        dream_team=dream_team,
+        team_change=team_change,
+        team_select=team_select,
+        back_button_ratio=back_button_ratio,
+        max_action_score=max_action_score,
+        save_list_info=save_list_info,
+        save_list_like=save_list_like,
+        home_like=home_like,
+        navigation_bootstrap_active=navigation_bootstrap_active,
+        operable_scene=operable_scene,
+        world_league_ready=world_league_ready,
+    )
 
 
 def main():
@@ -995,11 +1221,11 @@ def main():
     emit("startup", "[INFO] Starting SFCC auto click script")
     emit("startup", f"[INFO] Process name: {PROCESS_NAME}")
     emit("startup", "[INFO] Using the state-machine navigation strategy")
-    emit("startup", "[INFO] Debug images: last_capture.png / last_debug.png")
-    emit("startup", "[INFO] Runtime logs: logs/sfcc_run_*.log and logs/debug_*/")
+    emit("startup", "[INFO] Debug images: runtime/captures/last_capture.png / runtime/captures/last_debug.png")
+    emit("startup", "[INFO] Runtime logs: runtime/logs/sfcc_run_*.log and runtime/logs/debug/*/")
     emit("startup", "[INFO] Priority: action buttons > popup blue button > boot scene > fixed navigation > edge fallback")
     emit("startup", f"[INFO] Practice limit before shutdown: {PRACTICE_CLICK_LIMIT}")
-    emit("startup", f"[INFO] Game launch path: {GAME_EXE_PATH}")
+    emit("startup", f"[INFO] Game launch: Steam appid={STEAM_APP_ID}, exe_name={GAME_EXE_NAME}")
     emit("startup", "[INFO] Press Ctrl+C to exit")
 
     writer = StatusWriter(STATUS_FILE)
@@ -1007,40 +1233,58 @@ def main():
     boot_template = load_template(BOOT_TEMPLATE_PATH)
     world_prem_template = load_template(WORLD_PREM_TEMPLATE_PATH)
     save_list_template = load_template(SAVE_LIST_TEMPLATE_PATH)
+    change_team_template = load_template(CHANGE_TEAM_TEMPLATE_PATH)
     dream_team_templates = [load_template(path) for path in DREAM_TEAM_TEMPLATE_PATHS if path.exists()]
 
-    practice_click_count = 0
-    last_click_at = {k: 0.0 for k in action_templates.keys()}
-    last_popup_click_at = 0.0
-    last_edge_click_at = 0.0
-    last_nav_click_at = 0.0
-    last_team_change_at = 0.0
-    last_game_launch_at = 0.0
-    nav_phase = 'idle'   # boot_or_home -> dream_team -> dream_team_wait -> world_prem -> idle
-    nav_phase_since = time.time()
-    team_change_phase = 'idle'  # idle -> selecting -> scroll_top -> pick_first -> confirm
-    team_change_side = None
-    team_scrolls_done = 0
-    team_change_opened_at = 0.0
-    last_scan_log_at = 0.0
-    last_progress_at = time.time()
-    last_practice_click_count = 0
-    last_practice_progress_at = time.time()
-    save_list_phase = 'idle'
-    save_list_phase_since = time.time()
-    invalid_frame_since = 0.0
+    config = {
+        "ACTION_OVERRIDE_SCORE": ACTION_OVERRIDE_SCORE,
+        "BOOT_CLICK_RATIO": BOOT_CLICK_RATIO,
+        "BOOT_THRESHOLD": BOOT_THRESHOLD,
+        "BOOT_WAIT_SECONDS": BOOT_WAIT_SECONDS,
+        "CLICK_COOLDOWN": CLICK_COOLDOWN,
+        "CREATE_CLUB_CLICK_RATIO": CREATE_CLUB_CLICK_RATIO,
+        "CHANGE_TEAM_THRESHOLD": CHANGE_TEAM_THRESHOLD,
+        "EDGE_CLICK_COOLDOWN": EDGE_CLICK_COOLDOWN,
+        "ENABLE_EDGE_FALLBACK": ENABLE_EDGE_FALLBACK,
+        "NAV_CLICK_COOLDOWN": NAV_CLICK_COOLDOWN,
+        "NAV_STEP_TIMEOUT": NAV_STEP_TIMEOUT,
+        "POPUP_ACCEPT_SCORE": POPUP_ACCEPT_SCORE,
+        "POPUP_CLICK_COOLDOWN": POPUP_CLICK_COOLDOWN,
+        "PRACTICE_CLICK_LIMIT": PRACTICE_CLICK_LIMIT,
+        "SAVE_LIST_BACK_CLICK_RATIO": SAVE_LIST_BACK_CLICK_RATIO,
+        "SCAN_INTERVAL": SCAN_INTERVAL,
+        "SHUTDOWN_DELAY_SECONDS": SHUTDOWN_DELAY_SECONDS,
+        "TEAM_CHANGE_COOLDOWN": TEAM_CHANGE_COOLDOWN,
+        "TEAM_LIST_SCROLL_END_RATIO": TEAM_LIST_SCROLL_END_RATIO,
+        "TEAM_LIST_SCROLL_START_RATIO": TEAM_LIST_SCROLL_START_RATIO,
+        "TEAM_SELECT_CONFIRM_CLICK_RATIO": TEAM_SELECT_CONFIRM_CLICK_RATIO,
+        "TEAM_SELECT_FIRST_ROW_CLICK_RATIO": TEAM_SELECT_FIRST_ROW_CLICK_RATIO,
+        "TEAM_SELECT_OPEN_WAIT_SECONDS": TEAM_SELECT_OPEN_WAIT_SECONDS,
+        "WORLD_PREM_CLICK_RATIO": WORLD_PREM_CLICK_RATIO,
+        "WORLD_PREM_THRESHOLD": WORLD_PREM_THRESHOLD,
+    }
+    actions = {
+        "click_by_ratio": click_by_ratio,
+        "click_current_cursor": click_current_cursor,
+        "drag_by_ratio": drag_by_ratio,
+        "do_foreground_click": do_foreground_click,
+    }
+
+    ctx = RunContext(last_click_at={k: 0.0 for k in action_templates.keys()})
+    login_stage = LoginStageController(config, actions)
+    world_stage = WorldLeagueStageController(config, actions)
 
     while True:
         now = time.time()
         runtime_logger.maybe_cleanup_old_runs()
         pid = find_pid_by_name(PROCESS_NAME)
         if not pid:
-            launched, last_game_launch_at, msg = try_launch_game(last_game_launch_at)
-            writer.update(force=True, state='waiting_process', last_action='launch_game' if launched else 'waiting_process', practice_click_count=practice_click_count)
+            launched, ctx.last_game_launch_at, msg = try_launch_game(ctx.last_game_launch_at)
+            reset_to_login(ctx, login_stage.state, world_stage.state, now)
+            write_status(writer, ctx, login_stage.state, world_stage.state, force=True, state="waiting_process", last_action="launch_game" if launched else "waiting_process", practice_click_count=ctx.practice_click_count)
             emit("game", f"[GAME] {msg}", log_fields={"launched": launched})
             if launched:
-                nav_phase = 'boot_or_home'
-                nav_phase_since = time.time()
+                login_stage.state.set_phase("boot_or_home", time.time())
                 time.sleep(GAME_STARTUP_WAIT_SECONDS)
             else:
                 time.sleep(1.0)
@@ -1048,391 +1292,152 @@ def main():
 
         hwnd = find_main_hwnd_by_pid(pid)
         if not hwnd:
-            writer.update(state='waiting_window', last_action='waiting_window', practice_click_count=practice_click_count)
-            print('[WAIT] 鎵惧埌杩涚▼浣嗘湭鎵惧埌涓荤獥鍙ｏ紝绛夊緟涓?..', end='\r', flush=True)
+            write_status(writer, ctx, login_stage.state, world_stage.state, state="waiting_window", last_action="waiting_window", practice_click_count=ctx.practice_click_count)
+            print('[WAIT] 找到进程但未找到主窗口，等待中...', end='\r', flush=True)
             time.sleep(1.0)
             continue
 
         bring_window_if_hidden(hwnd)
         frame = capture_window_client(hwnd)
         if frame is None:
-            if invalid_frame_since == 0.0:
-                invalid_frame_since = now
-            writer.update(state='capture_failed', last_action='capture_failed', practice_click_count=practice_click_count)
-            if now - invalid_frame_since >= INVALID_FRAME_RESTART_SECONDS:
+            if ctx.invalid_frame_since == 0.0:
+                ctx.invalid_frame_since = now
+            write_status(writer, ctx, login_stage.state, world_stage.state, state="capture_failed", last_action="capture_failed", practice_click_count=ctx.practice_click_count)
+            if now - ctx.invalid_frame_since >= INVALID_FRAME_RESTART_SECONDS:
+                ctx.restart_reason = "invalid_frame"
                 emit(
                     "restart",
                     f"[SAFEGUARD] Invalid frame for {INVALID_FRAME_RESTART_SECONDS:.0f}s, restarting game pid={pid}",
                     archive_tag="restart_invalid_frame",
-                    log_fields={"pid": pid, "nav_phase": nav_phase},
+                    log_fields={"pid": pid, "stage": ctx.current_stage.value, "sub_stage": current_sub_stage(ctx, login_stage.state, world_stage.state)},
                 )
-                writer.update(force=True, state='restarting_game', last_action='restart_game_invalid_frame', practice_click_count=practice_click_count)
+                write_status(writer, ctx, login_stage.state, world_stage.state, force=True, state="restarting_game", last_action="restart_game_invalid_frame", practice_click_count=ctx.practice_click_count)
                 kill_process_tree(pid)
-                nav_phase = 'idle'
-                nav_phase_since = now
-                last_progress_at = time.time()
-                invalid_frame_since = 0.0
+                reset_to_login(ctx, login_stage.state, world_stage.state, now)
+                ctx.last_progress_at = time.time()
+                ctx.invalid_frame_since = 0.0
                 time.sleep(3.0)
                 continue
             print('[WARN] Invalid frame detected, retrying...', end='\r', flush=True)
             time.sleep(0.5)
             continue
-        invalid_frame_since = 0.0
+        ctx.invalid_frame_since = 0.0
 
-        hits, results = detect_buttons(frame, action_templates)
-        popup = detect_blue_popup_button(frame)
-        boot_score, boot_scale, boot_loc, boot_size = detect_boot_scene(frame, boot_template)
-        world_prem_score, world_prem_scale, world_prem_loc, world_prem_size = detect_world_prem_scene(frame, world_prem_template)
-        dream_team = detect_dream_team_scene(frame, dream_team_templates) if dream_team_templates else None
-        team_change = None
-        team_select = detect_team_select_scene(frame)
-        training_select = {"found": False}
-        back_button_ratio = detect_top_left_back_button(frame)
-        max_action_score = max(results[name]['score'] for name in ('continue', 'practice', 'view_result'))
-        save_list_info = detect_save_list_scene(frame, save_list_template, max_action_score, popup, boot_score)
-        save_list_like = save_list_info['found']
-        if not hits and not save_list_like and back_button_ratio >= BACK_BUTTON_HINT_RATIO:
-            best_name = max(('continue', 'practice', 'view_result'), key=lambda name: results[name]['score'])
-            best_result = results[best_name]
-            if (
-                best_result['score'] >= LOW_CONF_ACTION_ACCEPT_SCORE
-                and best_result.get('click_point') is not None
-            ):
-                hits.append((
-                    best_name,
-                    best_result['score'],
-                    best_result['click_point'],
-                    best_result['scale'],
-                    BUTTON_CONFIG[best_name]['priority'],
-                ))
-        fallback_home_like = (
-            not save_list_like
-            and
-            max_action_score < HOME_FALLBACK_MAX_ACTION_SCORE
-            and boot_score < HOME_FALLBACK_MAX_BOOT_SCORE
-            and (not popup or popup.get('score', -1.0) < POPUP_ACCEPT_SCORE)
+        scene = build_scene_snapshot(
+            frame,
+            now,
+            action_templates,
+            boot_template,
+            world_prem_template,
+            save_list_template,
+            change_team_template,
+            dream_team_templates,
+            ctx.practice_click_count,
         )
-        navigation_bootstrap_active = practice_click_count == 0 and max_action_score < ACTION_BUTTON_ACCEPT_SCORE
-        home_like = bool(
-            navigation_bootstrap_active
-            and (
-                (dream_team and dream_team.get('score', -1.0) >= HOME_SCENE_DREAM_SCORE and world_prem_score < WORLD_PREM_THRESHOLD)
-                or fallback_home_like
-            )
-        )
-        strong_action_hit = hits[0] if hits and hits[0][1] >= ACTION_OVERRIDE_SCORE else None
-        if nav_phase == 'idle' and home_like:
-            nav_phase = 'dream_team'
-            nav_phase_since = now
-        elif nav_phase == 'boot_or_home' and (strong_action_hit or max_action_score >= ACTION_OVERRIDE_SCORE):
-            nav_phase = 'idle'
-            nav_phase_since = now
-        elif nav_phase in ('boot_or_home', 'dream_team', 'dream_team_wait', 'world_prem') and (strong_action_hit or max_action_score >= ACTION_OVERRIDE_SCORE) and not home_like:
-            nav_phase = 'idle'
-            nav_phase_since = now
-        navigation_active = nav_phase in ('boot_or_home', 'dream_team', 'dream_team_wait', 'world_prem')
-        note = f"nav={nav_phase} boot={boot_score:.3f}"
-        if dream_team:
-            note += f" dream={dream_team['score']:.3f}"
-        note += f" world={world_prem_score:.3f}"
-        note += f" back={back_button_ratio:.3f}"
-        note += f" save={save_list_info['score']:.3f}"
-        if save_list_like:
+        scene.pid = pid
+        scene.hwnd = hwnd
+
+        note = f"stage={ctx.current_stage.value} sub={current_sub_stage(ctx, login_stage.state, world_stage.state)} boot={scene.boot_score:.3f}"
+        if scene.dream_team:
+            note += f" dream={scene.dream_team['score']:.3f}"
+        note += f" world={scene.world_prem_score:.3f}"
+        note += f" back={scene.back_button_ratio:.3f}"
+        note += f" save={scene.save_list_info['score']:.3f}"
+        if scene.save_list_like:
             note += " save_list=1"
-        operable_scene = bool(
-            hits
-            or (popup and popup.get('score', -1.0) >= POPUP_ACCEPT_SCORE)
-            or boot_score >= BOOT_THRESHOLD
-            or home_like
-            or save_list_like
-            or world_prem_score >= WORLD_PREM_THRESHOLD
-            or team_select.get('found')
-        )
-        if operable_scene:
-            last_progress_at = now
-        elif now - last_progress_at >= NO_PROGRESS_RESTART_SECONDS:
+
+        if scene.operable_scene:
+            ctx.last_progress_at = now
+        elif now - ctx.last_progress_at >= NO_PROGRESS_RESTART_SECONDS:
+            ctx.restart_reason = "no_operable_scene"
             emit(
                 "restart",
                 f"[SAFEGUARD] No operable scene for {NO_PROGRESS_RESTART_SECONDS:.0f}s, restarting game pid={pid}",
                 archive_tag="restart_no_progress",
-                log_fields={"pid": pid, "nav_phase": nav_phase},
+                log_fields={"pid": pid, "stage": ctx.current_stage.value, "sub_stage": current_sub_stage(ctx, login_stage.state, world_stage.state)},
             )
-            writer.update(force=True, state='restarting_game', last_action='restart_game_no_progress', practice_click_count=practice_click_count)
+            write_status(writer, ctx, login_stage.state, world_stage.state, force=True, state="restarting_game", last_action="restart_game_no_progress", practice_click_count=ctx.practice_click_count)
             kill_process_tree(pid)
-            nav_phase = 'idle'
-            nav_phase_since = now
-            last_progress_at = time.time()
+            reset_to_login(ctx, login_stage.state, world_stage.state, now)
+            ctx.last_progress_at = time.time()
             time.sleep(3.0)
             continue
 
-        if practice_click_count != last_practice_click_count:
-            last_practice_click_count = practice_click_count
-            last_practice_progress_at = now
-        elif practice_click_count > 0 and now - last_practice_progress_at >= PRACTICE_STALL_RESTART_SECONDS:
+        if ctx.practice_click_count != ctx.last_practice_click_count:
+            ctx.last_practice_click_count = ctx.practice_click_count
+            ctx.last_practice_progress_at = now
+        elif ctx.practice_click_count > 0 and now - ctx.last_practice_progress_at >= PRACTICE_STALL_RESTART_SECONDS:
+            ctx.restart_reason = "practice_stall"
             emit(
                 "restart",
-                f"[SAFEGUARD] Practice counter stalled for {PRACTICE_STALL_RESTART_SECONDS:.0f}s at #{practice_click_count}, restarting game pid={pid}",
+                f"[SAFEGUARD] Practice counter stalled for {PRACTICE_STALL_RESTART_SECONDS:.0f}s at #{ctx.practice_click_count}, restarting game pid={pid}",
                 archive_tag="restart_practice_stall",
-                log_fields={"pid": pid, "practice_click_count": practice_click_count, "nav_phase": nav_phase},
+                log_fields={"pid": pid, "practice_click_count": ctx.practice_click_count, "stage": ctx.current_stage.value, "sub_stage": current_sub_stage(ctx, login_stage.state, world_stage.state)},
             )
-            writer.update(force=True, state='restarting_game', last_action='restart_game_practice_stall', practice_click_count=practice_click_count)
+            write_status(writer, ctx, login_stage.state, world_stage.state, force=True, state="restarting_game", last_action="restart_game_practice_stall", practice_click_count=ctx.practice_click_count)
             kill_process_tree(pid)
-            nav_phase = 'idle'
-            nav_phase_since = now
-            last_progress_at = time.time()
-            last_practice_progress_at = time.time()
+            reset_to_login(ctx, login_stage.state, world_stage.state, now)
+            ctx.last_progress_at = time.time()
+            ctx.last_practice_progress_at = time.time()
             time.sleep(3.0)
             continue
 
-        if team_change_phase == 'idle' and team_change and team_change.get('exchange_box') and now - last_team_change_at >= TEAM_CHANGE_COOLDOWN:
-            box = team_change['exchange_box']
-            cx = int(box[0] + box[2] * 0.5)
-            cy = int(box[1] + box[3] * 0.5)
-            ok, msg = do_foreground_click(hwnd, cx, cy)
-            last_team_change_at = now
-            if ok:
-                team_change_phase = 'pick_first'
-                team_change_side = 'match_start'
-                team_scrolls_done = 0
-                team_change_opened_at = now
-                writer.update(force=True, state='team_change', last_action='team_open_selector', practice_click_count=practice_click_count)
-                emit("team", f"[TEAM] open_selector top_white={team_change['top_white']:.3f} person={team_change['exchange_person']:.3f} client=({cx},{cy}) -> {msg}", archive_tag="team_change", log_fields={"client_x": cx, "client_y": cy})
-                time.sleep(1.2)
-                continue
+        save_debug(frame, results=scene.results, popup=scene.popup, dream_team=scene.dream_team, note=note)
 
-        if team_change_phase != 'idle':
-            if team_change_phase == 'pick_first' and now - team_change_opened_at >= TEAM_SELECT_OPEN_WAIT_SECONDS:
-                if team_select.get('found'):
-                    x, y = team_select['first_row_point']
-                else:
-                    x = int(frame.shape[1] * TEAM_SELECT_FIRST_ROW_CLICK_RATIO[0])
-                    y = int(frame.shape[0] * TEAM_SELECT_FIRST_ROW_CLICK_RATIO[1])
-                ok, msg = do_foreground_click(hwnd, x, y)
-                last_team_change_at = now
-                if ok:
-                    team_change_phase = 'confirm'
-                    writer.update(force=True, state='team_change', last_action='team_pick_first', practice_click_count=practice_click_count)
-                    emit("team", f"[TEAM] pick_first client=({x},{y}) -> {msg}")
-                    time.sleep(0.8)
-                    continue
+        if ctx.current_stage == StageName.LOGIN:
+            stage_result = login_stage.tick(scene, ctx, writer, world_stage.state, emit)
+        else:
+            stage_result = world_stage.tick(scene, ctx, writer, login_stage.state, emit)
 
-            if team_change_phase == 'confirm' and now - last_team_change_at >= 0.6:
-                if team_select.get('found'):
-                    x, y = team_select['confirm_point']
-                else:
-                    x = int(frame.shape[1] * TEAM_SELECT_CONFIRM_CLICK_RATIO[0])
-                    y = int(frame.shape[0] * TEAM_SELECT_CONFIRM_CLICK_RATIO[1])
-                ok, msg = do_foreground_click(hwnd, x, y)
-                last_team_change_at = now
-                if ok:
-                    team_change_phase = 'idle'
-                    team_change_side = None
-                    team_scrolls_done = 0
-                    team_change_opened_at = 0.0
-                    writer.update(force=True, state='team_change', last_action='team_confirm', practice_click_count=practice_click_count)
-                    emit("team", f"[TEAM] confirm client=({x},{y}) -> {msg}")
-                    time.sleep(1.5)
-                    continue
-
-            if team_select.get('found'):
-                if team_change_phase == 'pick_first':
-                    x, y = team_select['first_row_point']
-                    ok, msg = do_foreground_click(hwnd, x, y)
-                    last_team_change_at = now
-                    if ok:
-                        team_change_phase = 'confirm'
-                        writer.update(force=True, state='team_change', last_action='team_pick_first', practice_click_count=practice_click_count)
-                        emit("team", f"[TEAM] pick_first client=({x},{y}) -> {msg}")
-                        time.sleep(0.8)
-                        continue
-                if team_change_phase == 'confirm':
-                    x, y = team_select['confirm_point']
-                    ok, msg = do_foreground_click(hwnd, x, y)
-                    last_team_change_at = now
-                    if ok:
-                        team_change_phase = 'idle'
-                        team_change_side = None
-                        team_scrolls_done = 0
-                        team_change_opened_at = 0.0
-                        writer.update(force=True, state='team_change', last_action='team_confirm', practice_click_count=practice_click_count)
-                        emit("team", f"[TEAM] confirm client=({x},{y}) -> {msg}")
-                        time.sleep(1.5)
-                        continue
-            elif now - last_team_change_at > 4.0:
-                team_change_phase = 'idle'
-                team_change_side = None
-                team_scrolls_done = 0
-                team_change_opened_at = 0.0
-        if not save_list_like:
-            save_list_phase = 'idle'
-            save_list_phase_since = now
-
-        save_debug(frame, results=results, popup=popup, dream_team=dream_team, note=note)
-
-        # 1) 鍙充笅鍔ㄤ綔鎸夐挳浼樺厛
-        if navigation_active:
-            hits = []
-        if hits:
-            btn_name, score, (x, y), scale, _ = hits[0]
-            writer.update(state='main_loop', last_button=btn_name, practice_click_count=practice_click_count)
-            if now - last_click_at[btn_name] >= CLICK_COOLDOWN:
-                ok, msg = do_foreground_click(hwnd, x, y)
-                last_click_at[btn_name] = now
-                nav_phase = 'idle'
-                nav_phase_since = now
-                if ok:
-                    if btn_name == 'practice':
-                        practice_click_count += 1
-                        writer.update(force=True, state='main_loop', last_action='click_practice', last_button=btn_name, practice_click_count=practice_click_count)
-                        emit("action", f'[ACT] practice #{practice_click_count}/{PRACTICE_CLICK_LIMIT} score={score:.3f} scale={scale:.2f} pos=({x},{y}) -> {msg}', archive_tag="action_practice", log_fields={"button": btn_name, "score": round(score, 4), "scale": scale, "client_x": x, "client_y": y})
-                        if practice_click_count >= PRACTICE_CLICK_LIMIT:
-                            writer.update(force=True, state='done', last_action='shutdown', last_button='practice', practice_click_count=practice_click_count)
-                            emit("done", f"[DONE] Practice clicked {practice_click_count} times, shutting down in {SHUTDOWN_DELAY_SECONDS}s")
-                            subprocess.run(['shutdown', '/s', '/t', str(SHUTDOWN_DELAY_SECONDS)], check=False)
-                            return
-                    else:
-                        writer.update(force=True, state='main_loop', last_action=f'click_{btn_name}', last_button=btn_name, practice_click_count=practice_click_count)
-                        emit("action", f'[ACT] {btn_name} score={score:.3f} scale={scale:.2f} pos=({x},{y}) -> {msg}', archive_tag=f"action_{btn_name}", log_fields={"button": btn_name, "score": round(score, 4), "scale": scale, "client_x": x, "client_y": y})
-                else:
-                    emit("warn", f'[WARN] {btn_name} score={score:.3f} pos=({x},{y}) -> {msg}', archive_tag=f"warn_{btn_name}")
-            else:
-                print(f'[SKIP] {btn_name} 鍐峰嵈涓?score={score:.3f}', end='\r', flush=True)
+        if stage_result == StageResult.SWITCH_TO_WORLD_LEAGUE:
+            ctx.current_stage = StageName.WORLD_LEAGUE
+            ctx.restart_reason = ""
+            world_stage.state.reset()
+            write_status(writer, ctx, login_stage.state, world_stage.state, force=True, state="stage_transition", last_action="world_league_ready", practice_click_count=ctx.practice_click_count)
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # 2) 寮圭獥钃濊壊鎸夐挳锛氫换浣曟枃鏈兘涓嶇锛岀洿鎺ョ偣鎸夐挳涓績
-        if popup and boot_score < BOOT_THRESHOLD and popup.get('score', -1.0) >= POPUP_ACCEPT_SCORE and now - last_popup_click_at >= POPUP_CLICK_COOLDOWN:
-            x, y = popup['center']
-            ok, msg = do_foreground_click(hwnd, x, y)
-            last_popup_click_at = now
-            writer.update(force=True, state='popup', last_action='popup_blue_button', practice_click_count=practice_click_count)
-            if ok:
-                emit("popup", f"[POPUP] blue_button score={popup['score']:.3f} bbox={popup['bbox']} client=({x},{y}) -> {msg}", archive_tag="popup_blue", log_fields={"score": round(popup['score'], 4), "bbox": popup['bbox'], "client_x": x, "client_y": y})
-            else:
-                emit("warn", f"[POPUP][WARN] bbox={popup['bbox']} client=({x},{y}) -> {msg}", archive_tag="popup_warn")
-            time.sleep(1.2)
+        if stage_result == StageResult.RESTART_GAME:
+            write_status(writer, ctx, login_stage.state, world_stage.state, force=True, state="restarting_game", last_action=f"restart_game_{ctx.restart_reason}", practice_click_count=ctx.practice_click_count)
+            kill_process_tree(pid)
+            reset_to_login(ctx, login_stage.state, world_stage.state, now)
+            ctx.last_progress_at = time.time()
+            ctx.last_practice_progress_at = time.time()
+            time.sleep(3.0)
             continue
 
-        # 3) 鍚姩椤碉細SEGA 鏂板垱閫犵悆浼?2026
-        if boot_score >= BOOT_THRESHOLD and now - last_nav_click_at >= NAV_CLICK_COOLDOWN:
-            (ok, msg), (cx, cy) = click_by_ratio(hwnd, BOOT_CLICK_RATIO[0], BOOT_CLICK_RATIO[1])
-            last_nav_click_at = now
-            nav_phase = 'dream_team'
-            nav_phase_since = now
-            writer.update(force=True, state='navigating', last_action='boot_click', practice_click_count=practice_click_count)
-            emit("nav", f'[NAV] boot_click score={boot_score:.3f} scale={boot_scale:.2f} client=({cx},{cy}) -> {msg}', archive_tag="nav_boot", log_fields={"score": round(boot_score, 4), "scale": boot_scale, "client_x": cx, "client_y": cy})
-            time.sleep(BOOT_WAIT_SECONDS)
-            continue
+        if stage_result == StageResult.DONE:
+            return
 
-        # 4) Enter the home scene and advance the navigation state machine.
-        if nav_phase == 'boot_or_home' and now - nav_phase_since > 2.0:
-            nav_phase = 'dream_team'
-            nav_phase_since = now
-
-        if nav_phase == 'dream_team' and now - last_nav_click_at >= NAV_CLICK_COOLDOWN:
-            if dream_team and dream_team.get('found') and dream_team.get('click_point') is not None:
-                cx, cy = dream_team['click_point']
-                ok, msg = do_foreground_click(hwnd, cx, cy)
-                nav_action = 'create_club_template_gate'
-                emit("nav", f"[NAV] create_club_template_gate score={dream_team['score']:.3f} bbox={dream_team['bbox']} client=({cx},{cy}) -> {msg}", archive_tag="nav_create_club_gate", log_fields={"score": round(dream_team['score'], 4), "bbox": dream_team['bbox'], "client_x": cx, "client_y": cy})
-            else:
-                (ok, msg), (cx, cy) = click_by_ratio(hwnd, CREATE_CLUB_CLICK_RATIO[0], CREATE_CLUB_CLICK_RATIO[1])
-                nav_action = 'create_club_fixed'
-                emit("nav", f"[NAV] create_club_fixed score={(dream_team['score'] if dream_team else -1.0):.3f} client=({cx},{cy}) -> {msg}", archive_tag="nav_create_club_fixed", log_fields={"score": round((dream_team['score'] if dream_team else -1.0), 4), "client_x": cx, "client_y": cy})
-            last_nav_click_at = now
-            if ok:
-                nav_phase = 'dream_team_wait'
-                nav_phase_since = now
-                writer.update(force=True, state='navigating', last_action=nav_action, practice_click_count=practice_click_count)
-                time.sleep(3.0)
-                continue
-            writer.update(force=True, state='navigating', last_action=f'{nav_action}_failed', practice_click_count=practice_click_count)
-
-        if nav_phase == 'dream_team_wait':
-            if world_prem_score >= WORLD_PREM_THRESHOLD:
-                nav_phase = 'world_prem'
-                nav_phase_since = now
-            elif save_list_like and now - last_nav_click_at >= NAV_CLICK_COOLDOWN:
-                (ok, msg), (cx, cy) = click_by_ratio(hwnd, SAVE_LIST_BACK_CLICK_RATIO[0], SAVE_LIST_BACK_CLICK_RATIO[1])
-                nav_action = 'save_list_back'
-                last_nav_click_at = now
-                emit("nav", f"[NAV] {nav_action} client=({cx},{cy}) -> {msg}", archive_tag=nav_action, log_fields={"client_x": cx, "client_y": cy})
-                if ok:
-                    nav_phase_since = now
-                    writer.update(force=True, state='navigating', last_action=nav_action, practice_click_count=practice_click_count)
-                    time.sleep(3.0)
-                    continue
-            elif home_like and now - nav_phase_since >= NAV_CLICK_COOLDOWN:
-                nav_phase = 'dream_team'
-                nav_phase_since = now
-            elif not navigation_bootstrap_active:
-                nav_phase = 'idle'
-                nav_phase_since = now
-            elif not home_like and now - nav_phase_since >= NAV_STEP_TIMEOUT:
-                nav_phase = 'idle'
-                nav_phase_since = now
-            elif home_like and now - nav_phase_since >= 18.0:
-                nav_phase = 'dream_team'
-                nav_phase_since = now
-            elif now - nav_phase_since >= NAV_STEP_TIMEOUT:
-                nav_phase = 'dream_team'
-                nav_phase_since = now
-
-        if nav_phase == 'world_prem' and now - last_nav_click_at >= NAV_CLICK_COOLDOWN:
-            (ok, msg), (cx, cy) = click_by_ratio(hwnd, WORLD_PREM_CLICK_RATIO[0], WORLD_PREM_CLICK_RATIO[1])
-            last_nav_click_at = now
-            emit("nav", f'[NAV] world_prem_fixed client=({cx},{cy}) -> {msg}', archive_tag="nav_world_prem", log_fields={"client_x": cx, "client_y": cy})
-            if ok:
-                nav_phase = 'idle'
-                nav_phase_since = now
-                writer.update(force=True, state='navigating', last_action='world_prem_fixed', practice_click_count=practice_click_count)
-                time.sleep(3.0)
-                continue
-            writer.update(force=True, state='navigating', last_action='world_prem_fixed_failed', practice_click_count=practice_click_count)
-
-        # 濡傛灉瀵艰埅鍚庨暱鏃堕棿杩樻病杩涜仈璧涢〉闈紝鍥炲埌姊﹀够鐞冮槦姝ラ閲嶆柊鏉ヤ竴娆?
-        if navigation_bootstrap_active and nav_phase == 'idle' and now - nav_phase_since >= NAV_STEP_TIMEOUT:
-            nav_phase = 'dream_team'
-            nav_phase_since = now
-
-        # 5) 鍏滃簳锛氬疄鍦ㄤ粈涔堥兘娌″彂鐜帮紝鐐逛竴娆″睆骞曞乏杈圭紭
-        if ENABLE_EDGE_FALLBACK and not navigation_active and now - last_edge_click_at >= EDGE_CLICK_COOLDOWN:
-            ok, msg = click_current_cursor(hwnd)
-            last_edge_click_at = now
-            writer.update(force=True, state='fallback', last_action='mouse_click', practice_click_count=practice_click_count)
-            print(f'[FALLBACK] mouse_click -> {msg}')
-            time.sleep(1.0)
-            continue
-
-        writer.update(state='scanning', last_action='scan_idle', practice_click_count=practice_click_count)
         if PRINT_BEST_SCORE:
-            c = results['continue']
-            p = results['practice']
-            v = results['view_result']
-            popup_text = 'none' if not popup else f"{popup['score']:.3f}@{popup['bbox']}"
+            c = scene.results['continue']
+            p = scene.results['practice']
+            v = scene.results['view_result']
+            popup_text = 'none' if not scene.popup else f"{scene.popup['score']:.3f}@{scene.popup['bbox']}"
             scan_line = (
                 f"[SCAN] continue={c['score']:.3f}@{c['scale']}/crop{c['crop_ratio']} "
                 f"practice={p['score']:.3f}@{p['scale']}/crop{p['crop_ratio']} "
                 f"view_result={v['score']:.3f}@{v['scale']}/crop{v['crop_ratio']} "
-                f"boot={boot_score:.3f}@{boot_scale} popup={popup_text} nav={nav_phase}"
+                f"boot={scene.boot_score:.3f}@{scene.boot_scale} popup={popup_text} stage={ctx.current_stage.value} sub={current_sub_stage(ctx, login_stage.state, world_stage.state)}"
             )
             print(scan_line, end='\r', flush=True)
-            if now - last_scan_log_at >= SCAN_LOG_INTERVAL_SECONDS:
+            if now - ctx.last_scan_log_at >= SCAN_LOG_INTERVAL_SECONDS:
                 runtime_logger.log(
                     "scan",
                     scan_line,
-                    nav_phase=nav_phase,
+                    stage=ctx.current_stage.value,
+                    sub_stage=current_sub_stage(ctx, login_stage.state, world_stage.state),
                     continue_score=round(c['score'], 4),
                     practice_score=round(p['score'], 4),
                     view_result_score=round(v['score'], 4),
-                    boot_score=round(boot_score, 4),
-                    world_prem_score=round(world_prem_score, 4),
-                    dream_team_score=round((dream_team['score'] if dream_team else -1.0), 4),
-                    popup_score=round((popup['score'] if popup else -1.0), 4),
+                    boot_score=round(scene.boot_score, 4),
+                    world_prem_score=round(scene.world_prem_score, 4),
+                    dream_team_score=round((scene.dream_team['score'] if scene.dream_team else -1.0), 4),
+                    popup_score=round((scene.popup['score'] if scene.popup else -1.0), 4),
                 )
-                last_scan_log_at = now
+                ctx.last_scan_log_at = now
         else:
-            print('[SCAN] 鏈娴嬪埌鐩爣鎸夐挳', end='\r', flush=True)
+            print('[SCAN] 未检测到目标按钮', end='\r', flush=True)
         time.sleep(SCAN_INTERVAL)
 
 

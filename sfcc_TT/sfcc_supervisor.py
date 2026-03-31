@@ -27,7 +27,8 @@ MAX_RAPID_RESTARTS = 10
 RAPID_RESTART_WINDOW_SECONDS = 60
 PASS_THROUGH_ARGS = True
 WORKDIR = Path(__file__).resolve().parent
-STATUS_FILE = WORKDIR / "sfcc_status.json"
+RUNTIME_DIR = WORKDIR / "runtime"
+STATUS_FILE = RUNTIME_DIR / "sfcc_status.json"
 HEARTBEAT_POLL_SECONDS = 2.0
 STATUS_HEARTBEAT_TIMEOUT_SECONDS = 45.0
 STATUS_STARTUP_GRACE_SECONDS = 90.0
@@ -36,8 +37,8 @@ GAME_PROCESS_NAME = "FootballClubChampions.exe"
 
 
 child_proc: subprocess.Popen | None = None
-SUPERVISOR_PID_FILE = WORKDIR / "sfcc_supervisor.pid"
-CHILD_PID_FILE = WORKDIR / "sfcc_child.pid"
+SUPERVISOR_PID_FILE = RUNTIME_DIR / "sfcc_supervisor.pid"
+CHILD_PID_FILE = RUNTIME_DIR / "sfcc_child.pid"
 
 
 def log(msg: str) -> None:
@@ -46,6 +47,7 @@ def log(msg: str) -> None:
 
 def write_pid(path: Path, pid: int | None) -> None:
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         if pid is None:
             if path.exists():
                 path.unlink()

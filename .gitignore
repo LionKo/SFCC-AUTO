@@ -11,6 +11,7 @@ build/
 venv/
 env/
 ENV/
+.venv/
 
 # 进程ID文件
 *.pid
