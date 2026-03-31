@@ -13,6 +13,9 @@ env/
 ENV/
 .venv/
 
+# 运行时和临时目录
+sfcc_TT/runtime/
+
 # 进程ID文件
 *.pid
 
