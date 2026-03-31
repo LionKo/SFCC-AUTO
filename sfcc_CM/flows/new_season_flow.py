@@ -33,6 +33,7 @@ FINAL_CONFIRM_BUTTONS = ["final_confirm_ok_button", "final_confirm_ok_button2"]
 CLUB_TRANSFERS_MIN_CLICK_COOLDOWN_SECONDS = 1.0
 FINAL_CONFIRM_TO_MAIN_HANDOFF_SECONDS = 8.0
 FINAL_CONFIRM_TO_MAIN_POLL_INTERVAL_SECONDS = 0.2
+FINAL_CONFIRM_FALLBACK_CLICK_INTERVAL_SECONDS = 0.8
 NEW_SEASON_FOLLOWUP_POLL_INTERVAL_SECONDS = 0.2
 NEW_SEASON_CHAIN_CONTINUATION_SECONDS = 20.0
 NEW_SEASON_CHAIN_IDLE_MISS_LIMIT = 5
@@ -42,6 +43,7 @@ SP_JOIN_CONFIRM_HANDOFF_SECONDS = 10.0
 SP_JOIN_CONFIRM_MAX_CLICKS = 2
 CLUB_TRANSFERS_SETTLE_SECONDS = 1.0
 CLUB_TRANSFERS_CONFIRM_WAIT_SECONDS = 10.0
+CLUB_TRANSFERS_HANDOFF_SECONDS = 8.0
 CLUB_TRANSFERS_LEVEL_SETTLE_SECONDS = 2.0
 SPONSOR_SELECTION_SETTLE_SECONDS = 1.0
 SP_JOIN_SETTLE_SECONDS = 2.0
@@ -336,6 +338,7 @@ class NewSeasonFlow:
         followup_level_screenshot = None
         level_seen_count = 0
         saw_ok_chs = False
+        popup_confirm_clicks = 0
         confirm_deadline = time.time() + CLUB_TRANSFERS_CONFIRM_WAIT_SECONDS
         while time.time() < confirm_deadline:
             if not self.bot.check_runtime_process_only():
@@ -357,6 +360,7 @@ class NewSeasonFlow:
             popup_confirm_center = self._find_club_transfers_popup_confirm_center(screenshot)
             if popup_confirm_center:
                 self.mark_active()
+                popup_confirm_clicks += 1
                 logging.info(
                     "Club transfers follow-up detected the centered green confirm button, clicking it directly at (%s, %s)",
                     popup_confirm_center[0],
@@ -380,18 +384,39 @@ class NewSeasonFlow:
             logging.info("Club transfers handoff detected club_transfers_level")
             return self._dispatch_step("club_transfers_level", screenshot=followup_level_screenshot, fast_dispatch=True)
 
-        advanced, followup_screenshot = self._wait_for_expected_step("club_transfers_level", timeout=6.0)
+        advanced, followup_screenshot = self._wait_for_followup_step(
+            {"club_transfers_level", "sponsor_selection", "sp_join", "final_confirm", "creative_mode_main"},
+            timeout=CLUB_TRANSFERS_HANDOFF_SECONDS,
+        )
         if advanced:
-            logging.info("Club transfers handoff detected club_transfers_level")
-            return self.run_club_transfers_level(screenshot=followup_screenshot, assume_detected=True)
+            if advanced == "club_transfers_level":
+                logging.info("Club transfers handoff detected club_transfers_level")
+                return self.run_club_transfers_level(screenshot=followup_screenshot, assume_detected=True)
+            if advanced == "sponsor_selection":
+                logging.info("Club transfers handoff detected sponsor_selection")
+                return self.run_sponsor_selection(assume_detected=True)
+            if advanced == "sp_join":
+                logging.info("Club transfers handoff detected sp_join")
+                return self.run_sp_join(screenshot=followup_screenshot, assume_detected=True)
+            if advanced == "final_confirm":
+                logging.info("Club transfers handoff detected final_confirm")
+                return self.run_final_confirm(assume_detected=True)
+            if advanced == "creative_mode_main":
+                logging.info("Club transfers flow returned directly to creative mode main screen")
+                return True
 
         final_screenshot = self.bot.vision.capture()
         if self.bot.find_club_transfers_screen_in_screenshot(final_screenshot):
             logging.warning(
-                "Club transfers is still active after the renewal flow%s; keeping the new-season chain alive instead of dropping back to the scheduler",
+                "Club transfers is still active after the renewal flow%s; treating this as a stuck handoff instead of a successful chain continuation",
                 " with ok_chs handled" if saw_ok_chs else "",
             )
-            return True
+            if popup_confirm_clicks > 0:
+                logging.warning(
+                    "Club transfers popup confirm was clicked %s time(s), but no downstream step was detected",
+                    popup_confirm_clicks,
+                )
+            return False
         return False
 
     def run_club_transfers_level(self, screenshot=None, assume_detected: bool = False) -> bool:
@@ -676,20 +701,36 @@ class NewSeasonFlow:
         button = self.bot.click_named_button(FINAL_CONFIRM_BUTTONS, timeout=5.0, settle=1.0)
         if not button:
             logging.warning("Final confirm button not found")
-            fallback_screenshot = self.bot.vision.capture()
-            if self.bot.find_main_screen_in_screenshot(fallback_screenshot):
-                logging.info("Final confirm button disappeared because creative mode main is already visible, handing off inline")
-                return self.bot.main_flow.run(30.0, screenshot=fallback_screenshot, assume_main_visible=True)
-            return False
-
-        time.sleep(FINAL_CONFIRM_SETTLE_SECONDS)
-        ok_chs = self.bot.vision.wait_for_any(["ok_chs_button"], min(self.bot.button_threshold, 0.72), timeout=2.5, interval=0.2)
-        if ok_chs:
-            logging.info("Final confirm follow-up dialog detected: %s (score=%.3f)", ok_chs.name, ok_chs.score)
-            self.bot.click_match(ok_chs, settle=0.35)
-        self.bot.last_final_confirm_time = time.time()
+            if self.handle_priority_confirm(timeout=0.6, settle=0.25):
+                self.bot.last_final_confirm_time = time.time()
+            else:
+                fallback_screenshot = self.bot.vision.capture()
+                if self.bot.find_main_screen_in_screenshot(fallback_screenshot):
+                    logging.info("Final confirm button disappeared because creative mode main is already visible, handing off inline")
+                    return self.bot.main_flow.run(30.0, screenshot=fallback_screenshot, assume_main_visible=True)
+                if self.bot.find_final_confirm_screen_in_screenshot(fallback_screenshot):
+                    logging.info("Final confirm screen is still visible without a matched button, using bottom-right confirm fallback")
+                    self.bot.window.click_client_bottom_right(settle=0.35)
+                    self.bot.last_final_confirm_time = time.time()
+                else:
+                    visible_followup = self._dispatch_visible_followup_step(
+                        ("sp_join", "final_confirm"),
+                        screenshot=fallback_screenshot,
+                        log_prefix="Final confirm flow",
+                    )
+                    if visible_followup is not None:
+                        return bool(visible_followup)
+                    return False
+        else:
+            time.sleep(FINAL_CONFIRM_SETTLE_SECONDS)
+            ok_chs = self.bot.vision.wait_for_any(["ok_chs_button"], min(self.bot.button_threshold, 0.72), timeout=2.5, interval=0.2)
+            if ok_chs:
+                logging.info("Final confirm follow-up dialog detected: %s (score=%.3f)", ok_chs.name, ok_chs.score)
+                self.bot.click_match(ok_chs, settle=0.35)
+            self.bot.last_final_confirm_time = time.time()
 
         deadline = time.time() + FINAL_CONFIRM_TO_MAIN_HANDOFF_SECONDS
+        last_fallback_click_time = 0.0
         while time.time() < deadline:
             if not self.bot.check_runtime_process_only():
                 return False
@@ -701,6 +742,14 @@ class NewSeasonFlow:
 
             if self.handle_priority_confirm(timeout=0.2, settle=0.2):
                 continue
+
+            if self.bot.find_final_confirm_screen_in_screenshot(screenshot):
+                now = time.time()
+                if now - last_fallback_click_time >= FINAL_CONFIRM_FALLBACK_CLICK_INTERVAL_SECONDS:
+                    logging.info("Final confirm handoff still shows the final-confirm screen, using bottom-right confirm fallback")
+                    self.bot.window.click_client_bottom_right(settle=0.25)
+                    last_fallback_click_time = now
+                    continue
 
             time.sleep(FINAL_CONFIRM_TO_MAIN_POLL_INTERVAL_SECONDS)
         return True

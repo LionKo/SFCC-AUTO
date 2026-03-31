@@ -122,7 +122,7 @@ STORY_PROGRESS_HOTSPOT_RATIO = (0.498, 0.388)
 CLUB_TRANSFERS_MIN_RATIO = (0.334, 0.642)
 EXPECTED_CLIENT_WIDTH = 1920
 EXPECTED_CLIENT_HEIGHT = 1080
-CLIENT_SIZE_TOLERANCE_PIXELS = 2
+CLIENT_SIZE_TOLERANCE_PIXELS = 6
 SCREEN_STUCK_TIMEOUT_SECONDS = 120.0
 NO_SCHEDULE_TIMEOUT_SECONDS = 900.0
 BOOTSTRAP_TIMEOUT_SECONDS = 180.0
@@ -130,6 +130,17 @@ BOOTSTRAP_POST_LOGIN_GAME_MAIN_SECONDS = 20.0
 VISUAL_STALL_TIMEOUT_SECONDS = 120.0
 VISUAL_STALL_CHECK_INTERVAL_SECONDS = 5.0
 VISUAL_STALL_DIFF_THRESHOLD = 1.2
+RECOVERY_STORY_STREAK_RESET_SECONDS = 8.0
+RECOVERY_STORY_STREAK_THRESHOLD = 3
+STAGE_STUCK_RESTART_FLOWS = {"generic", "main"}
+STAGE_STUCK_RESTART_STAGES = {
+    "creative_mode_main",
+    "special_training",
+    "match_reward",
+    "league_result",
+    "connecting",
+    "event_dialog",
+}
 LOGIN_SCREEN_THRESHOLD = 0.55
 STAGE_SCAN_BASE_INTERVAL_SECONDS = 4.0
 STAGE_SCAN_UNKNOWN_INTERVAL_SECONDS = 1.5
@@ -879,6 +890,9 @@ class CreativeModeBot:
         self.last_special_training_run_time = 0.0
         self.last_club_transfers_min_click_time = 0.0
         self.last_bootstrap_login_click_time = 0.0
+        self.special_training_unavailable_until = 0.0
+        self.recovery_story_streak = 0
+        self.last_recovery_story_seen_time = 0.0
         self.active_flow = "generic"
         self.last_visual_probe_time = 0.0
         self.last_visual_change_time = now
@@ -902,6 +916,15 @@ class CreativeModeBot:
             return
         logging.debug("Active flow changed: %s -> %s", self.active_flow, flow_name)
         self.active_flow = flow_name
+
+    def invalidate_runtime_stage(self, reason: str, new_stage: str = "unknown") -> None:
+        now = time.time()
+        if self.last_stage_signature != new_stage:
+            logging.info("Stage changed: %s -> %s", self.last_stage_signature, new_stage)
+        self.last_stage_signature = new_stage
+        self.last_stage_change_time = now
+        self.last_stage_probe_time = 0.0
+        logging.info("Runtime stage invalidated because %s", reason)
 
     def _pick_best_match(self, *matches: MatchResult | None) -> MatchResult | None:
         available = [match for match in matches if match is not None]
@@ -1091,6 +1114,9 @@ class CreativeModeBot:
             self.last_special_training_run_time = 0.0
             self.last_club_transfers_min_click_time = 0.0
             self.last_bootstrap_login_click_time = 0.0
+            self.special_training_unavailable_until = 0.0
+            self.recovery_story_streak = 0
+            self.last_recovery_story_seen_time = 0.0
             self.active_flow = "bootstrap"
             self.last_visual_probe_time = 0.0
             self.last_visual_change_time = now
@@ -1741,7 +1767,11 @@ class CreativeModeBot:
 
         now = time.time()
         stage_stuck_seconds = now - self.last_stage_change_time
-        if stage != "unknown" and stage_stuck_seconds >= SCREEN_STUCK_TIMEOUT_SECONDS:
+        can_restart_for_stage_stuck = (
+            self.active_flow in STAGE_STUCK_RESTART_FLOWS
+            and stage in STAGE_STUCK_RESTART_STAGES
+        )
+        if can_restart_for_stage_stuck and stage_stuck_seconds >= SCREEN_STUCK_TIMEOUT_SECONDS:
             self.request_restart(f"stage '{stage}' stuck for {stage_stuck_seconds:.0f}s")
             return False
 
@@ -2115,6 +2145,62 @@ class CreativeModeBot:
             logging.info("Event flow finished and main screen returned")
             return True
         return False
+
+    def note_recovery_story_presence(self, screenshot: np.ndarray | None = None) -> bool:
+        screenshot = screenshot if screenshot is not None else self.vision.capture()
+        now = time.time()
+        if now - self.last_recovery_story_seen_time > RECOVERY_STORY_STREAK_RESET_SECONDS:
+            self.recovery_story_streak = 0
+
+        log_match = self.vision.match_best_in_region(
+            screenshot,
+            ["log", "log2"],
+            min(self.button_threshold, 0.72),
+            REGION_TOP_RIGHT,
+        )
+        skip_match = self.vision.match_best(
+            screenshot,
+            SKIP_BUTTONS,
+            min(self.button_threshold, SKIP_THRESHOLD),
+        )
+        event_choice = self.find_event_choice_in_screenshot(screenshot)
+        story_visible = bool(log_match or skip_match or event_choice)
+        if story_visible:
+            self.recovery_story_streak += 1
+            self.last_recovery_story_seen_time = now
+        elif now - self.last_recovery_story_seen_time > RECOVERY_STORY_STREAK_RESET_SECONDS:
+            self.recovery_story_streak = 0
+        return story_visible
+
+    def clear_recovery_story_presence(self) -> None:
+        self.recovery_story_streak = 0
+        self.last_recovery_story_seen_time = 0.0
+
+    def handle_recovery_story_stall(self, screenshot: np.ndarray | None = None) -> bool:
+        screenshot = screenshot if screenshot is not None else self.vision.capture()
+        story_visible = self.note_recovery_story_presence(screenshot)
+        if not story_visible:
+            return False
+
+        if self.recovery_story_streak < RECOVERY_STORY_STREAK_THRESHOLD:
+            return False
+
+        logging.info(
+            "Recovery detected persistent story/skip chain (streak=%s), prioritizing aggressive story cleanup",
+            self.recovery_story_streak,
+        )
+        handled = False
+        if self.handle_story_dialog_fast(screenshot=screenshot, attempts=6):
+            handled = True
+        if self.handle_post_schedule_events(max_clicks=10):
+            handled = True
+        if not handled:
+            self.click_skip_hotspot(settle=0.08)
+            handled = True
+        if self.rapidly_advance_event_story(attempts=8, settle=0.08):
+            self.clear_recovery_story_presence()
+            return True
+        return handled
 
     def handle_story_dialog_fast(self, screenshot: np.ndarray | None = None, attempts: int = 4) -> bool:
         screenshot = screenshot if screenshot is not None else self.vision.capture()
@@ -3075,17 +3161,23 @@ class CreativeModeBot:
 
     def try_enter_special_training_fast(self) -> bool:
         transition_settle_seconds = 1.0
-        transition_wait_seconds = 4.0
+        transition_wait_seconds = 2.4
+        quick_main_return_fail_seconds = 0.45
+        if time.time() < self.special_training_unavailable_until:
+            logging.info("Fast path is skipping special training because it was recently confirmed unavailable")
+            return False
         for attempt in range(1, 3):
             if not self.check_runtime_process_only():
                 return False
             screenshot = self.vision.capture()
             title = self.find_special_training_title_in_screenshot(screenshot)
             if title:
+                self.special_training_unavailable_until = 0.0
                 logging.info("Entered special training page via fast path: %s", title.name)
                 return True
             special_training_screen = self.find_special_training_screen_in_screenshot(screenshot)
             if special_training_screen:
+                self.special_training_unavailable_until = 0.0
                 logging.info(
                     "Entered special training page via fast path screen markers: %s (score=%.3f)",
                     special_training_screen.name,
@@ -3123,17 +3215,20 @@ class CreativeModeBot:
                 time.sleep(0.1)
 
             handoff_deadline = time.time() + transition_wait_seconds
+            handoff_started_at = time.time()
             while time.time() < handoff_deadline:
                 if not self.check_runtime_process_only():
                     return False
                 handoff_screenshot = self.vision.capture()
                 title = self.find_special_training_title_in_screenshot(handoff_screenshot)
                 if title:
+                    self.special_training_unavailable_until = 0.0
                     logging.info("Entered special training page via fast path: %s", title.name)
                     return True
 
                 special_training_screen = self.find_special_training_screen_in_screenshot(handoff_screenshot)
                 if special_training_screen:
+                    self.special_training_unavailable_until = 0.0
                     logging.info(
                         "Entered special training page via fast path screen markers: %s (score=%.3f)",
                         special_training_screen.name,
@@ -3142,13 +3237,28 @@ class CreativeModeBot:
                     return True
 
                 if self.find_main_screen_in_screenshot(handoff_screenshot):
+                    elapsed = time.time() - handoff_started_at
                     logging.info(
-                        "Fast path special training handoff returned to creative mode main screen after attempt %s",
+                        "Fast path special training handoff returned to creative mode main screen after attempt %s (elapsed=%.2fs)",
                         attempt,
+                        elapsed,
                     )
-                    break
+                    if elapsed < quick_main_return_fail_seconds:
+                        self.special_training_unavailable_until = time.time() + SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS
+                        logging.info(
+                            "Fast path is treating special training as unavailable after a quick return to main; cooling down for %.0fs",
+                            SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS,
+                        )
+                        return False
+                    self.special_training_unavailable_until = time.time() + SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS
+                    logging.info(
+                        "Fast path is treating special training as unavailable after a return to main without opening settings; cooling down for %.0fs",
+                        SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS,
+                    )
+                    return False
 
                 time.sleep(0.12)
+        self.special_training_unavailable_until = time.time() + SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS
         logging.info("Fast path did not confirm special training settings after two attempts")
         return False
 
@@ -3480,22 +3590,34 @@ class CreativeModeBot:
 
         if allow_bootstrap_to_main_fastlane and time.time() - self.last_bootstrap_to_main_time <= BOOTSTRAP_TO_MAIN_FASTLANE_SECONDS:
             main_visible = self.find_main_screen_in_screenshot(screenshot)
-            if self.main_flow.matches(screenshot) and (main_visible or not in_post_schedule_exception_fastlane):
+            special_training_visible = self.find_special_training_screen_in_screenshot(screenshot)
+            confirmed_main = self.is_confirmed_main_screen(screenshot)
+            if (special_training_visible or confirmed_main) and (main_visible or not in_post_schedule_exception_fastlane):
                 logging.info("%s is within the bootstrap-to-main fast lane, dispatching directly to main flow", stage_prefix)
-                return self.main_flow.run(max_wait_seconds, screenshot=screenshot, assume_main_visible=True)
+                return self.main_flow.run(
+                    max_wait_seconds,
+                    screenshot=screenshot,
+                    assume_main_visible=confirmed_main and not special_training_visible,
+                )
 
         if self.bootstrap_flow.matches(screenshot):
             logging.info("%s belongs to the bootstrap layer", stage_prefix)
             return self.run_bootstrap_flow(handoff_main_wait_seconds=max_wait_seconds)
 
         main_visible = self.find_main_screen_in_screenshot(screenshot)
-        allow_main_dispatch = self.main_flow.matches(screenshot)
+        special_training_visible = self.find_special_training_screen_in_screenshot(screenshot)
+        confirmed_main = self.is_confirmed_main_screen(screenshot)
+        allow_main_dispatch = bool(special_training_visible or confirmed_main)
         if allow_post_schedule_main_guard:
             allow_main_dispatch = allow_main_dispatch and (main_visible or not in_post_schedule_exception_fastlane)
         if allow_main_dispatch:
             logging.info("%s belongs to the creative-mode main layer", stage_prefix)
             logging.info("Dispatching %s directly into main_flow.run()", stage_prefix.lower())
-            result = self.main_flow.run(max_wait_seconds, screenshot=screenshot, assume_main_visible=True)
+            result = self.main_flow.run(
+                max_wait_seconds,
+                screenshot=screenshot,
+                assume_main_visible=confirmed_main and not special_training_visible,
+            )
             logging.info("main_flow.run() returned %s for %s", result, stage_prefix.lower())
             return result
 
@@ -3547,11 +3669,14 @@ class CreativeModeBot:
                 self.set_active_flow("new_season")
                 logging.info("Loop start is already inside the active new-season context, dispatching before common flow")
                 return self.new_season_flow.run(initial_screenshot, fast_dispatch=True)
-            if self.find_main_screen_in_screenshot(initial_screenshot):
+            initial_main_match = self.find_main_screen_in_screenshot(initial_screenshot)
+            if initial_main_match and self.is_confirmed_main_screen(initial_screenshot):
                 logging.info("Loop start strongly confirms the creative-mode main screen, dispatching before common flow")
                 stage_result = self._dispatch_loop_start_by_stage(initial_screenshot, max_wait_seconds)
                 if stage_result is not None:
                     return stage_result
+            elif initial_main_match:
+                logging.info("Loop start saw a weak main-screen match, but confirmation failed; falling back to common/stage handling")
             if self.common_flow.run_once(initial_screenshot, max_clicks=1):
                 return True
             stage_result = self._dispatch_loop_start_by_stage(initial_screenshot, max_wait_seconds)

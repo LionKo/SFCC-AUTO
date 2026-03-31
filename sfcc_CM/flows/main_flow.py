@@ -14,7 +14,10 @@ class ScreenRegion:
     bottom_ratio: float
 
 
+REGION_WIDE_TOP = ScreenRegion(0.0, 0.0, 1.0, 0.32)
+REGION_TOP_RIGHT = ScreenRegion(0.72, 0.0, 1.0, 0.24)
 REGION_BOTTOM_RIGHT = ScreenRegion(0.56, 0.56, 1.0, 1.0)
+REGION_CONFIRM_CHAIN = ScreenRegion(0.46, 0.48, 1.0, 1.0)
 MAIN_SCREEN_BUTTONS = [
     "creative_mode_advance_schedule_button_small",
     "creative_mode_advance_schedule_button",
@@ -30,6 +33,11 @@ POST_SCHEDULE_CONFIRM_BUTTONS = [
     "final_confirm_ok_button",
     "final_confirm_ok_button2",
 ]
+SEASON_END_OK_BUTTONS = [
+    "ok_button",
+    "ok_button2",
+    "ok_button3",
+]
 SPECIAL_TRAINING_RESET_BUTTONS = ["special_training_reset_all_button", "special_training_reset_all_button2"]
 SPECIAL_TRAINING_RECOMMEND_BUTTONS = ["special_training_recommend_button", "special_training_recommend_button2"]
 SPECIAL_TRAINING_EXECUTE_BUTTONS = ["special_training_execute_button", "special_training_execute_button2"]
@@ -42,6 +50,8 @@ MATCH_SEQUENCE_RESULT_BUTTONS = ["match_result_button"]
 MATCH_SEQUENCE_STICKY_SECONDS = 25.0
 SEASON_END_TITLE_TEXT = ("\u68a6\u5e7b\u7403\u961f",)
 SEASON_END_STICKY_SECONDS = 25.0
+SEASON_END_TO_NEW_SEASON_WAIT_SECONDS = 8.0
+SEASON_END_TO_NEW_SEASON_POLL_SECONDS = 0.2
 
 
 class MainFlow:
@@ -58,7 +68,7 @@ class MainFlow:
         title = self.bot._match_ocr_title(
             screenshot,
             MATCH_SEQUENCE_TITLE_TEXT,
-            self.bot.REGION_WIDE_TOP if hasattr(self.bot, "REGION_WIDE_TOP") else ScreenRegion(0.0, 0.0, 1.0, 0.32),
+            REGION_WIDE_TOP,
             min_score=0.35,
         )
         result_button = self.bot.vision.match_best(
@@ -110,7 +120,7 @@ class MainFlow:
         title = self.bot._match_ocr_title(
             screenshot,
             SEASON_END_TITLE_TEXT,
-            self.bot.REGION_WIDE_TOP if hasattr(self.bot, "REGION_WIDE_TOP") else ScreenRegion(0.0, 0.0, 1.0, 0.32),
+            REGION_WIDE_TOP,
             min_score=0.35,
         )
         if title:
@@ -120,26 +130,48 @@ class MainFlow:
         if time.time() - self.last_season_end_time <= SEASON_END_STICKY_SECONDS:
             if self.bot.detect_new_season_step_in_screenshot(screenshot):
                 return False
-            confirm_button = self.bot.vision.match_best_in_region(
-                screenshot,
-                POST_SCHEDULE_CONFIRM_BUTTONS,
-                min(self.bot.button_threshold, 0.72),
-                REGION_BOTTOM_RIGHT,
-            )
+            confirm_button = self._find_season_end_confirm_button(screenshot)
             if confirm_button:
                 return True
         return False
+
+    def _find_season_end_confirm_button(self, screenshot):
+        return self.bot.vision.match_best_in_region(
+            screenshot,
+            SEASON_END_OK_BUTTONS,
+            min(self.bot.button_threshold, 0.72),
+            REGION_CONFIRM_CHAIN,
+        )
+
+    def _should_enter_season_end_fallback(self, screenshot) -> bool:
+        if self._is_season_end_screen(screenshot):
+            return True
+        if self.bot.detect_new_season_step_in_screenshot(screenshot):
+            return False
+        if self.bot.find_match_reward_screen_in_screenshot(screenshot):
+            return False
+        if self.bot.find_special_training_screen_in_screenshot(screenshot):
+            return False
+        if self._is_match_sequence_screen(screenshot):
+            return False
+        if self.bot.find_main_screen_in_screenshot(screenshot) or self.bot.should_trust_main_screen(screenshot):
+            return False
+        confirm_button = self._find_season_end_confirm_button(screenshot)
+        if not confirm_button:
+            return False
+        self.last_season_end_time = time.time()
+        logging.info(
+            "Season-end fallback activated from confirm chain: %s (score=%.3f)",
+            confirm_button.name,
+            confirm_button.score,
+        )
+        return True
 
     def _handle_season_end(self, screenshot) -> bool:
         if not self._is_season_end_screen(screenshot):
             return False
 
-        confirm_button = self.bot.vision.match_best_in_region(
-            screenshot,
-            POST_SCHEDULE_CONFIRM_BUTTONS,
-            min(self.bot.button_threshold, 0.72),
-            REGION_BOTTOM_RIGHT,
-        )
+        confirm_button = self._find_season_end_confirm_button(screenshot)
         if confirm_button:
             logging.info(
                 "Season-end stage detected right-side confirm: %s (score=%.3f)",
@@ -148,6 +180,31 @@ class MainFlow:
             )
             self.bot.click_match(confirm_button, settle=0.15)
             self.last_season_end_time = time.time()
+            handoff_deadline = time.time() + SEASON_END_TO_NEW_SEASON_WAIT_SECONDS
+            while time.time() < handoff_deadline:
+                if not self.bot.check_runtime_process_only():
+                    return False
+                handoff_screenshot = self.bot.vision.capture()
+                next_step = self.bot.detect_new_season_step_in_screenshot(handoff_screenshot)
+                if next_step:
+                    logging.info(
+                        "Season-end handoff detected new-season step %s after confirm, dispatching inline",
+                        next_step,
+                    )
+                    self.last_season_end_time = 0.0
+                    return self.bot.new_season_flow.run_step(next_step, screenshot=handoff_screenshot, fast_dispatch=True)
+                if self._is_season_end_screen(handoff_screenshot):
+                    next_confirm = self._find_season_end_confirm_button(handoff_screenshot)
+                    if next_confirm:
+                        logging.info(
+                            "Season-end handoff detected another OK in chain: %s (score=%.3f)",
+                            next_confirm.name,
+                            next_confirm.score,
+                        )
+                        self.bot.click_match(next_confirm, settle=0.15)
+                        self.last_season_end_time = time.time()
+                        continue
+                time.sleep(SEASON_END_TO_NEW_SEASON_POLL_SECONDS)
             return True
 
         logging.info("Season-end stage is active, waiting for the next right-side confirm to appear")
@@ -178,6 +235,9 @@ class MainFlow:
         ):
             logging.info("Main transition chain detected a bootstrap stage")
             return False
+
+        if self._should_enter_season_end_fallback(screenshot):
+            return self._handle_season_end(screenshot)
 
         quick_button = self.bot.vision.match_best(
             screenshot,
@@ -394,11 +454,20 @@ class MainFlow:
             screenshot = self.bot.vision.capture()
             main_visible = self.bot.find_main_screen_in_screenshot(screenshot)
             trusted_main = self.bot.should_trust_main_screen(screenshot)
-            if not main_visible and not trusted_main and not self.bot.is_confirmed_main_screen(screenshot):
+            confirmed_main = self.bot.is_confirmed_main_screen(screenshot) if not main_visible and not trusted_main else main_visible or trusted_main
+            if not main_visible and not trusted_main and not confirmed_main:
+                self.bot.invalidate_runtime_stage("fast advance schedule precheck could not confirm main screen")
                 logging.warning("Fast advance schedule aborted because the current screen is not a confirmed creative mode main screen")
                 return False
             if trusted_main and not main_visible:
                 logging.info("Fast advance schedule trusted recent creative mode main-screen confirmation")
+                refreshed = self.bot.vision.capture()
+                if not self.bot.is_confirmed_main_screen(refreshed):
+                    self.bot.invalidate_runtime_stage("trusted main screen check failed before fast advance schedule click")
+                    logging.warning("Fast advance schedule aborted because a second main-screen confirmation failed")
+                    return False
+                screenshot = refreshed
+                main_visible = self.bot.find_main_screen_in_screenshot(screenshot)
             match = self.bot.find_advance_schedule_button_in_screenshot(screenshot)
             action_clicked = False
             if not match:
@@ -447,6 +516,8 @@ class MainFlow:
                 break
 
             if post_schedule_main_visible or post_schedule_main_trusted:
+                if attempt == 1:
+                    self.bot.invalidate_runtime_stage("fast advance schedule click left the bot on main screen")
                 logging.warning("Fast advance schedule click did not leave main screen, retrying (attempt %s)", attempt)
                 continue
 
@@ -455,6 +526,7 @@ class MainFlow:
             break
 
         if not left_main_screen:
+            self.bot.invalidate_runtime_stage("fast advance schedule failed to leave main screen after retries")
             self.bot.vision.save_debug_screenshot("advance_schedule_fast_leave_failed")
             logging.error("Fast advance schedule failed to leave main screen")
             return False

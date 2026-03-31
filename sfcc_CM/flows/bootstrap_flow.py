@@ -2,9 +2,32 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 
 UNKNOWN_BOOTSTRAP_SETTLE_AFTER_VISUAL_CHANGE_SECONDS = 2.5
 SAVE_SELECTION_MAIN_HANDOFF_TIMEOUT_SECONDS = 6.0
+
+
+@dataclass(frozen=True)
+class ScreenRegion:
+    left_ratio: float
+    top_ratio: float
+    right_ratio: float
+    bottom_ratio: float
+
+
+REGION_TOP_RIGHT = ScreenRegion(0.72, 0.0, 1.0, 0.24)
+POST_SAVE_MAIN_INTERMEDIATE_BUTTONS = [
+    "continue_button",
+    "continue_button2",
+    "continue_button3",
+    "ok_button",
+    "ok_button2",
+    "ok_button3",
+    "ok_chs_button",
+    "skip_button",
+    "skip_button2",
+]
 
 
 class BootstrapFlow:
@@ -31,12 +54,12 @@ class BootstrapFlow:
             screenshot,
             ["log", "log2"],
             min(self.bot.button_threshold, self.bot.dialog_threshold, 0.72),
-            self.bot.REGION_TOP_RIGHT,
+            REGION_TOP_RIGHT,
         ):
             return True
         if self.bot.vision.match_best(
             screenshot,
-            self.bot.CONTINUE_BUTTONS + self.bot.CONFIRM_BUTTONS + self.bot.SKIP_BUTTONS,
+            POST_SAVE_MAIN_INTERMEDIATE_BUTTONS,
             min(self.bot.button_threshold, 0.72),
         ):
             return True
