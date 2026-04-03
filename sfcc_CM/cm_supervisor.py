@@ -130,7 +130,6 @@ class BotSupervisor:
 
     def shutdown_all(self) -> None:
         self.stop_child()
-        self.stop_game_processes()
 
     def run(self) -> int:
         self.write_supervisor_pid()

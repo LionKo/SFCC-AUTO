@@ -8,6 +8,12 @@ class RecoveryFlow:
     def __init__(self, bot: object) -> None:
         self.bot = bot
 
+    def _get_recovery_frame(self):
+        recent_stage, recent_screenshot = self.bot.get_recent_stage_probe(max_age_seconds=1.2)
+        if recent_screenshot is not None:
+            return recent_stage, recent_screenshot
+        return recent_stage, self.bot.vision.capture()
+
     def run(self, timeout_seconds: float) -> bool:
         screenshot = self.bot.vision.capture()
         if self.bot.should_trust_main_screen(screenshot):
@@ -21,11 +27,8 @@ class RecoveryFlow:
         while time.time() < deadline:
             if not self.bot.check_runtime_health():
                 return False
-            screenshot = self.bot.vision.capture()
+            recent_stage, screenshot = self._get_recovery_frame()
             trusted_main = self.bot.should_trust_main_screen(screenshot)
-
-            if self.bot.handle_global_priority_buttons(max_clicks=1, initial_screenshot=screenshot):
-                continue
 
             if self.bot.find_main_screen_in_screenshot(screenshot) or trusted_main:
                 self.bot.clear_recovery_story_presence()
@@ -54,70 +57,9 @@ class RecoveryFlow:
                 self.bot.clear_recovery_story_presence()
                 return True
 
-            if (
-                self.bot.find_login_screen_in_screenshot(screenshot)
-                or self.bot.find_game_main_screen_in_screenshot(screenshot)
-                or self.bot.find_save_selection_screen_in_screenshot(screenshot)
-            ):
-                if self.bot.run_bootstrap_flow():
-                    return True
-                continue
-
-            if self.bot.run_new_season_flow(screenshot):
-                logging.info("Handled new season flow during recovery")
-                return True
-
-            if self.bot.handle_recovery_story_stall(screenshot=screenshot):
-                if self.bot.is_main_screen():
-                    self.bot.set_active_flow("main")
-                    logging.info("Recovered to creative mode main screen via aggressive story cleanup")
-                    return True
-                continue
-
             if self.bot.handle_exception_layer(max_clicks=2, initial_screenshot=screenshot):
                 if self.bot.is_main_screen():
                     logging.info("Recovered to creative mode main screen via exception-layer handling")
-                    return True
-                continue
-
-            if self.bot.handle_post_schedule_events(max_clicks=6):
-                if self.bot.is_main_screen():
-                    self.bot.clear_recovery_story_presence()
-                    logging.info("Recovered to creative mode main screen via event handling")
-                    return True
-                continue
-
-            if self.bot.handle_league_result_screen():
-                if self.bot.is_main_screen():
-                    logging.info("Recovered to creative mode main screen via league-result handling")
-                    return True
-                continue
-
-            if self.bot.handle_connecting_screen():
-                if self.bot.is_main_screen():
-                    logging.info("Recovered to creative mode main screen via CONNECTING handling")
-                    return True
-                continue
-
-            if self.bot.handle_match_reward_screen():
-                continue
-
-            main_after_reward = self.bot.find_main_screen_recovery_hint(self.bot.vision.capture())
-            if main_after_reward:
-                self.bot.set_active_flow("main")
-                logging.info(
-                    "Recovery accepted creative mode main screen after reward handling via %s (score=%.3f)",
-                    main_after_reward.name,
-                    main_after_reward.score,
-                )
-                return True
-
-            if self.bot.handle_speed_one_anywhere():
-                refreshed = self.bot.vision.capture()
-                if self.bot.find_main_screen_in_screenshot(refreshed) or self.bot.find_main_screen_recovery_hint(refreshed):
-                    self.bot.set_active_flow("main")
-                    self.bot.clear_recovery_story_presence()
-                    logging.info("Recovery resumed main flow immediately after speed handling on creative mode main screen")
                     return True
                 continue
 

@@ -35,21 +35,24 @@ FINAL_CONFIRM_TO_MAIN_HANDOFF_SECONDS = 8.0
 FINAL_CONFIRM_TO_MAIN_POLL_INTERVAL_SECONDS = 0.2
 FINAL_CONFIRM_FALLBACK_CLICK_INTERVAL_SECONDS = 0.8
 NEW_SEASON_FOLLOWUP_POLL_INTERVAL_SECONDS = 0.2
-NEW_SEASON_CHAIN_CONTINUATION_SECONDS = 20.0
+NEW_SEASON_CHAIN_CONTINUATION_SECONDS = 30.0
 NEW_SEASON_CHAIN_IDLE_MISS_LIMIT = 5
 CLUB_TRANSFERS_LEVEL_FOLLOWUP_SECONDS = 10.0
 SPONSOR_SELECTION_FOLLOWUP_SECONDS = 8.0
 SP_JOIN_CONFIRM_HANDOFF_SECONDS = 10.0
 SP_JOIN_CONFIRM_MAX_CLICKS = 2
 CLUB_TRANSFERS_SETTLE_SECONDS = 1.0
-CLUB_TRANSFERS_CONFIRM_WAIT_SECONDS = 10.0
+CLUB_TRANSFERS_CONFIRM_WAIT_SECONDS = 5.0
 CLUB_TRANSFERS_HANDOFF_SECONDS = 8.0
+CLUB_TRANSFERS_CHAINED_OK_CHS_THRESHOLD = 0.82
+CLUB_TRANSFERS_CHAINED_OK_CHS_MAX_OFFSET = 220
 CLUB_TRANSFERS_LEVEL_SETTLE_SECONDS = 2.0
 SPONSOR_SELECTION_SETTLE_SECONDS = 1.0
 SP_JOIN_SETTLE_SECONDS = 2.0
 FINAL_CONFIRM_SETTLE_SECONDS = 3.0
 CLUB_TRANSFERS_CONFIRM_POPUP_REGION = (0.34, 0.54, 0.74, 0.84)
 CLUB_TRANSFERS_CONFIRM_POPUP_MIN_AREA = 3500
+SP_JOIN_SLOT_OFFSET_MAX_DISTANCE = 180
 
 NEW_SEASON_STEP_LABELS = {
     "club_transfers": "club transfers",
@@ -58,6 +61,7 @@ NEW_SEASON_STEP_LABELS = {
     "final_confirm": "final confirm",
     "sp_join": "SP join",
 }
+FORMAL_NEW_SEASON_STEPS = tuple(NEW_SEASON_STEP_LABELS.keys())
 
 
 class NewSeasonFlow:
@@ -66,6 +70,12 @@ class NewSeasonFlow:
 
     def mark_active(self) -> None:
         self.bot.last_new_season_activity_time = time.time()
+
+    def detect_step(self, screenshot) -> str | None:
+        return self.bot.detect_new_season_step_in_screenshot(screenshot)
+
+    def matches_any_step(self, screenshot) -> bool:
+        return self.detect_step(screenshot) is not None
 
     def handle_priority_confirm(self, timeout: float = 1.5, settle: float = 0.5) -> bool:
         ok = self.bot.vision.wait_for_any(
@@ -82,7 +92,25 @@ class NewSeasonFlow:
         return True
 
     def matches(self, screenshot) -> bool:
-        return self.bot.detect_new_season_step_in_screenshot(screenshot) is not None
+        return self.matches_any_step(screenshot)
+
+    def _dispatch_formal_step(self, step: str, *, screenshot=None, log_prefix: str) -> bool | None:
+        if step == "club_transfers_level":
+            logging.info("%s detected visible club_transfers_level, continuing inline", log_prefix)
+            return self.run_club_transfers_level(screenshot=screenshot, assume_detected=True)
+        if step == "sponsor_selection":
+            logging.info("%s detected visible sponsor_selection, continuing inline", log_prefix)
+            return self.run_sponsor_selection(assume_detected=True)
+        if step == "sp_join":
+            logging.info("%s detected visible sp_join, continuing inline", log_prefix)
+            return self.run_sp_join(screenshot=screenshot, assume_detected=True)
+        if step == "final_confirm":
+            logging.info("%s detected visible final_confirm, continuing inline", log_prefix)
+            return self.run_final_confirm(assume_detected=True)
+        if step == "creative_mode_main":
+            logging.info("%s detected creative mode main screen, ending new-season flow", log_prefix)
+            return True
+        return None
 
     def run_step(self, step: str, screenshot=None, fast_dispatch: bool = False) -> bool:
         if fast_dispatch:
@@ -123,7 +151,7 @@ class NewSeasonFlow:
                 logging.info("New-season chain has already returned to creative mode main screen")
                 return True
 
-            step = current_step or self.bot.detect_new_season_step_in_screenshot(current_screenshot)
+            step = current_step or self.detect_step(current_screenshot)
             if not step:
                 if self.handle_priority_confirm(timeout=0.25, settle=0.2):
                     idle_misses = 0
@@ -150,7 +178,7 @@ class NewSeasonFlow:
                 logging.info("New-season chain returned to creative mode main screen")
                 return True
 
-            followup_step = self.bot.detect_new_season_step_in_screenshot(current_screenshot)
+            followup_step = self.detect_step(current_screenshot)
             if followup_step:
                 logging.info(
                     "New-season chain continuing directly into %s",
@@ -196,7 +224,7 @@ class NewSeasonFlow:
             if "club_transfers" in allowed_steps and self.bot.find_club_transfers_screen_in_screenshot(screenshot):
                 return "club_transfers", screenshot
 
-            next_step = self.bot.detect_new_season_step_in_screenshot(screenshot)
+            next_step = self.detect_step(screenshot)
             if next_step in allowed_steps:
                 return next_step, screenshot
 
@@ -209,35 +237,6 @@ class NewSeasonFlow:
             time.sleep(poll_interval)
         return None, None
 
-    def _wait_for_expected_step(
-        self,
-        expected_step: str,
-        timeout: float,
-        poll_interval: float = NEW_SEASON_FOLLOWUP_POLL_INTERVAL_SECONDS,
-    ) -> tuple[bool, object | None]:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if not self.bot.check_runtime_process_only():
-                return False, None
-
-            screenshot = self.bot.vision.capture()
-            if expected_step == "club_transfers_level" and self.bot.find_club_transfers_level_screen_in_screenshot(screenshot):
-                return True, screenshot
-            if expected_step == "sponsor_selection" and self.bot.find_sponsor_selection_screen_in_screenshot(screenshot):
-                return True, screenshot
-            if expected_step == "sp_join" and self.bot.find_sp_join_screen_in_screenshot(screenshot):
-                return True, screenshot
-            if expected_step == "final_confirm" and self.bot.find_final_confirm_screen_in_screenshot(screenshot):
-                return True, screenshot
-            if expected_step == "creative_mode_main" and self.bot.find_main_screen_in_screenshot(screenshot):
-                return True, screenshot
-
-            if expected_step != "club_transfers_level" and self.handle_priority_confirm(timeout=0.2, settle=0.2):
-                continue
-
-            time.sleep(poll_interval)
-        return False, None
-
     def _dispatch_visible_followup_step(
         self,
         allowed_steps: tuple[str, ...],
@@ -248,23 +247,37 @@ class NewSeasonFlow:
         current = screenshot if screenshot is not None else self.bot.vision.capture()
 
         for step in allowed_steps:
-            if step == "club_transfers_level" and self.bot.find_club_transfers_level_screen_in_screenshot(current):
-                logging.info("%s detected visible club_transfers_level, continuing inline", log_prefix)
-                return self.run_club_transfers_level(screenshot=current, assume_detected=True)
-            if step == "sponsor_selection" and self.bot.find_sponsor_selection_screen_in_screenshot(current):
-                logging.info("%s detected visible sponsor_selection, continuing inline", log_prefix)
-                return self.run_sponsor_selection(assume_detected=True)
-            if step == "sp_join" and self.bot.find_sp_join_screen_in_screenshot(current):
-                logging.info("%s detected visible sp_join, continuing inline", log_prefix)
-                return self.run_sp_join(screenshot=current, assume_detected=True)
-            if step == "final_confirm" and self.bot.find_final_confirm_screen_in_screenshot(current):
-                logging.info("%s detected visible final_confirm, continuing inline", log_prefix)
-                return self.run_final_confirm(assume_detected=True)
+            if step in FORMAL_NEW_SEASON_STEPS:
+                detected_step = self.detect_step(current)
+                if detected_step == step:
+                    return self._dispatch_formal_step(step, screenshot=current, log_prefix=log_prefix)
             if step == "creative_mode_main" and self.bot.find_main_screen_in_screenshot(current):
-                logging.info("%s detected creative mode main screen, ending new-season flow", log_prefix)
-                return True
+                return self._dispatch_formal_step(step, screenshot=current, log_prefix=log_prefix)
 
         return None
+
+    def _continue_to_allowed_steps(
+        self,
+        allowed_steps: tuple[str, ...],
+        timeout: float,
+        *,
+        screenshot=None,
+        log_prefix: str,
+    ) -> bool:
+        visible = self._dispatch_visible_followup_step(allowed_steps, screenshot=screenshot, log_prefix=log_prefix)
+        if visible is not None:
+            return bool(visible)
+
+        followup_step, followup_screenshot = self._wait_for_followup_step(set(allowed_steps), timeout=timeout)
+        if not followup_step:
+            return False
+
+        result = self._dispatch_formal_step(
+            followup_step,
+            screenshot=followup_screenshot,
+            log_prefix=f"{log_prefix} handoff",
+        )
+        return bool(result)
 
     def _find_club_transfers_popup_confirm_center(self, screenshot) -> tuple[int, int] | None:
         height, width = screenshot.shape[:2]
@@ -328,22 +341,32 @@ class NewSeasonFlow:
         if not title:
             return self.run_club_transfers_level()
 
+        self.bot.update_runtime_stage(force=True)
         logging.info("Club transfers screen detected, starting renewal flow")
         renewal = self.bot.click_named_button(CLUB_TRANSFERS_RENEWAL_BUTTONS, timeout=5.0, settle=1.0)
         if not renewal:
             logging.warning("Club transfers renewal button not found")
             return False
 
+        self.bot.update_runtime_stage(force=True)
         time.sleep(CLUB_TRANSFERS_SETTLE_SECONDS)
         followup_level_screenshot = None
         level_seen_count = 0
         saw_ok_chs = False
+        ok_chs_anchor_center = None
         popup_confirm_clicks = 0
         confirm_deadline = time.time() + CLUB_TRANSFERS_CONFIRM_WAIT_SECONDS
         while time.time() < confirm_deadline:
             if not self.bot.check_runtime_process_only():
                 return False
             screenshot = self.bot.vision.capture()
+            visible_followup = self._dispatch_visible_followup_step(
+                ("club_transfers_level", "sponsor_selection", "sp_join", "final_confirm", "creative_mode_main"),
+                screenshot=screenshot,
+                log_prefix="Club transfers follow-up",
+            )
+            if visible_followup is not None:
+                return visible_followup
             ok_chs = self.bot.vision.match_best(
                 screenshot,
                 ["ok_chs_button"],
@@ -352,10 +375,65 @@ class NewSeasonFlow:
             if ok_chs:
                 self.mark_active()
                 saw_ok_chs = True
+                ok_chs_anchor_center = ok_chs.center
                 logging.info("Club transfers follow-up confirm detected: %s (score=%.3f)", ok_chs.name, ok_chs.score)
-                self.bot.click_match(ok_chs, settle=0.35)
-                time.sleep(CLUB_TRANSFERS_SETTLE_SECONDS)
-                break
+                self.bot.click_match(ok_chs, settle=0.2)
+                ok_chs_chain_deadline = time.time() + min(CLUB_TRANSFERS_HANDOFF_SECONDS, 3.5)
+                while time.time() < ok_chs_chain_deadline:
+                    if not self.bot.check_runtime_process_only():
+                        return False
+                    post_confirm_screenshot = self.bot.vision.capture()
+                    visible_followup = self._dispatch_visible_followup_step(
+                        ("club_transfers_level", "sponsor_selection", "sp_join", "final_confirm", "creative_mode_main"),
+                        screenshot=post_confirm_screenshot,
+                        log_prefix="Club transfers confirm",
+                    )
+                    if visible_followup is not None:
+                        return visible_followup
+                    if self.bot.find_club_transfers_level_screen_in_screenshot(post_confirm_screenshot):
+                        logging.info("Club transfers confirm advanced directly into club_transfers_level")
+                        return self.run_club_transfers_level(screenshot=post_confirm_screenshot, assume_detected=True)
+                    chained_ok_chs = self.bot.vision.match_best(
+                        post_confirm_screenshot,
+                        ["ok_chs_button"],
+                        max(min(self.bot.button_threshold, 0.82), CLUB_TRANSFERS_CHAINED_OK_CHS_THRESHOLD),
+                    )
+                    if chained_ok_chs:
+                        if ok_chs_anchor_center is not None:
+                            offset_x = abs(chained_ok_chs.center[0] - ok_chs_anchor_center[0])
+                            offset_y = abs(chained_ok_chs.center[1] - ok_chs_anchor_center[1])
+                            if (
+                                offset_x > CLUB_TRANSFERS_CHAINED_OK_CHS_MAX_OFFSET
+                                or offset_y > CLUB_TRANSFERS_CHAINED_OK_CHS_MAX_OFFSET
+                            ):
+                                logging.info(
+                                    "Ignoring inline club-transfers ok_chs follow-up because it moved too far from the original confirm button (dx=%s, dy=%s, score=%.3f)",
+                                    offset_x,
+                                    offset_y,
+                                    chained_ok_chs.score,
+                                )
+                                chained_ok_chs = None
+                    if chained_ok_chs:
+                        self.mark_active()
+                        logging.info(
+                            "Club transfers follow-up confirm is still visible, clicking it again inline (score=%.3f)",
+                            chained_ok_chs.score,
+                        )
+                        self.bot.click_match(chained_ok_chs, settle=0.2)
+                        continue
+                    popup_confirm_center = self._find_club_transfers_popup_confirm_center(post_confirm_screenshot)
+                    if popup_confirm_center:
+                        self.mark_active()
+                        popup_confirm_clicks += 1
+                        logging.info(
+                            "Club transfers inline follow-up detected the centered green confirm button, clicking it directly at (%s, %s)",
+                            popup_confirm_center[0],
+                            popup_confirm_center[1],
+                        )
+                        self.bot.window.click_client(popup_confirm_center[0], popup_confirm_center[1], settle=0.2)
+                        continue
+                    time.sleep(0.15)
+                continue
 
             popup_confirm_center = self._find_club_transfers_popup_confirm_center(screenshot)
             if popup_confirm_center:
@@ -366,9 +444,24 @@ class NewSeasonFlow:
                     popup_confirm_center[0],
                     popup_confirm_center[1],
                 )
-                self.bot.window.click_client(popup_confirm_center[0], popup_confirm_center[1], settle=0.35)
-                time.sleep(CLUB_TRANSFERS_SETTLE_SECONDS)
-                break
+                self.bot.window.click_client(popup_confirm_center[0], popup_confirm_center[1], settle=0.2)
+                popup_chain_deadline = time.time() + min(CLUB_TRANSFERS_HANDOFF_SECONDS, 3.0)
+                while time.time() < popup_chain_deadline:
+                    if not self.bot.check_runtime_process_only():
+                        return False
+                    post_popup_screenshot = self.bot.vision.capture()
+                    visible_followup = self._dispatch_visible_followup_step(
+                        ("club_transfers_level", "sponsor_selection", "sp_join", "final_confirm", "creative_mode_main"),
+                        screenshot=post_popup_screenshot,
+                        log_prefix="Club transfers popup confirm",
+                    )
+                    if visible_followup is not None:
+                        return visible_followup
+                    if self.bot.find_club_transfers_level_screen_in_screenshot(post_popup_screenshot):
+                        logging.info("Club transfers popup confirm advanced directly into club_transfers_level")
+                        return self.run_club_transfers_level(screenshot=post_popup_screenshot, assume_detected=True)
+                    time.sleep(0.15)
+                continue
 
             if self.bot.find_club_transfers_level_screen_in_screenshot(screenshot):
                 level_seen_count += 1
@@ -406,6 +499,14 @@ class NewSeasonFlow:
                 return True
 
         final_screenshot = self.bot.vision.capture()
+        self.bot.update_runtime_stage(force=True)
+        followup_retry = self._dispatch_visible_followup_step(
+            ("club_transfers_level", "sponsor_selection", "sp_join", "final_confirm", "creative_mode_main"),
+            screenshot=final_screenshot,
+            log_prefix="Club transfers final follow-up",
+        )
+        if followup_retry is not None:
+            return followup_retry
         if self.bot.find_club_transfers_screen_in_screenshot(final_screenshot):
             logging.warning(
                 "Club transfers is still active after the renewal flow%s; treating this as a stuck handoff instead of a successful chain continuation",
@@ -449,10 +550,13 @@ class NewSeasonFlow:
                     return self.run_sponsor_selection(assume_detected=True)
                 if self.bot.find_main_screen_in_screenshot(screenshot):
                     return True
-                advanced, followup_screenshot = self._wait_for_expected_step("sponsor_selection", timeout=CLUB_TRANSFERS_LEVEL_FOLLOWUP_SECONDS)
-                if advanced:
-                    logging.info("Club transfers level handoff detected sponsor_selection")
-                    return self.run_sponsor_selection(assume_detected=True)
+                if self._continue_to_allowed_steps(
+                    ("sponsor_selection", "creative_mode_main"),
+                    CLUB_TRANSFERS_LEVEL_FOLLOWUP_SECONDS,
+                    screenshot=screenshot,
+                    log_prefix="Club transfers level",
+                ):
+                    return True
                 time.sleep(0.2)
                 continue
 
@@ -488,10 +592,12 @@ class NewSeasonFlow:
                     logging.info("Club transfers level follow-up confirm detected: %s (score=%.3f)", ok_button.name, ok_button.score)
                     self.bot.click_match(ok_button, settle=0.3)
                     time.sleep(CLUB_TRANSFERS_LEVEL_SETTLE_SECONDS)
-                    advanced, followup_screenshot = self._wait_for_expected_step("sponsor_selection", timeout=CLUB_TRANSFERS_LEVEL_FOLLOWUP_SECONDS)
-                    if advanced:
-                        logging.info("Club transfers level post-confirm detected sponsor_selection")
-                        return self.run_sponsor_selection(assume_detected=True)
+                    if self._continue_to_allowed_steps(
+                        ("sponsor_selection", "creative_mode_main"),
+                        CLUB_TRANSFERS_LEVEL_FOLLOWUP_SECONDS,
+                        log_prefix="Club transfers level post-confirm",
+                    ):
+                        return True
                     continue
 
             if self.bot.find_main_screen_in_screenshot(screenshot):
@@ -523,23 +629,11 @@ class NewSeasonFlow:
             return False
 
         time.sleep(SPONSOR_SELECTION_SETTLE_SECONDS)
-        deadline = time.time() + SPONSOR_SELECTION_FOLLOWUP_SECONDS
-        while time.time() < deadline:
-            if not self.bot.check_runtime_process_only():
-                return False
-
-            followup_screenshot = self.bot.vision.capture()
-            if self.bot.find_sp_join_screen_in_screenshot(followup_screenshot):
-                logging.info("Sponsor selection handoff detected sp_join")
-                return self.run_sp_join(screenshot=followup_screenshot, assume_detected=True)
-            if self.bot.find_final_confirm_screen_in_screenshot(followup_screenshot):
-                logging.info("Sponsor selection flow has already advanced to final_confirm, continuing inline")
-                return self.run_final_confirm(assume_detected=True)
-            if self.bot.find_main_screen_in_screenshot(followup_screenshot):
-                logging.info("Sponsor selection flow returned directly to creative mode main screen")
-                return True
-            time.sleep(NEW_SEASON_FOLLOWUP_POLL_INTERVAL_SECONDS)
-        return False
+        return self._continue_to_allowed_steps(
+            ("sp_join", "final_confirm", "creative_mode_main"),
+            SPONSOR_SELECTION_FOLLOWUP_SECONDS,
+            log_prefix="Sponsor selection",
+        )
 
     def select_sp_join_candidates(self, screenshot, max_select: int = 3) -> int:
         belong_matches = self.bot.vision.match_all(
@@ -553,30 +647,64 @@ class NewSeasonFlow:
             len(belong_matches),
             [f"({match.center[0]},{match.center[1]},{match.score:.2f})" for match in belong_matches[:10]],
         )
+        offset_x, offset_y = self._estimate_sp_join_slot_offset(belong_matches)
+        if offset_x or offset_y:
+            logging.info("Applying SP join slot offset correction dx=%s dy=%s based on current visible players", offset_x, offset_y)
         selected = 0
         for slot_x, slot_y in SP_JOIN_SLOT_CENTERS:
+            adjusted_slot_x = slot_x + offset_x
+            adjusted_slot_y = slot_y + offset_y
             has_belong = any(
-                abs(match.center[0] - slot_x) <= 95 and abs(match.center[1] - (slot_y - 115)) <= 95
+                abs(match.center[0] - adjusted_slot_x) <= 95 and abs(match.center[1] - (adjusted_slot_y - 115)) <= 95
                 for match in belong_matches
             )
             if has_belong:
-                logging.info("Skipping SP slot at (%s, %s) because sp_belong marker is nearby", slot_x, slot_y)
+                logging.info(
+                    "Skipping SP slot at adjusted position (%s, %s) because sp_belong marker is nearby",
+                    adjusted_slot_x,
+                    adjusted_slot_y,
+                )
                 continue
-            click_x = slot_x
-            click_y = slot_y + SP_JOIN_SLOT_CLICK_OFFSET_Y
+            click_x = adjusted_slot_x
+            click_y = adjusted_slot_y + SP_JOIN_SLOT_CLICK_OFFSET_Y
             self.bot.window.click_client(click_x, click_y, settle=0.9)
             selected += 1
             logging.info(
                 "Selected SP player slot using adjusted click target (%s, %s) from slot center (%s, %s), total=%s",
                 click_x,
                 click_y,
-                slot_x,
-                slot_y,
+                adjusted_slot_x,
+                adjusted_slot_y,
                 selected,
             )
             if selected >= max_select:
                 break
         return selected
+
+    def _estimate_sp_join_slot_offset(self, belong_matches) -> tuple[int, int]:
+        if not belong_matches:
+            return 0, 0
+
+        candidate_offsets: list[tuple[int, int]] = []
+        anchor_points = [(slot_x, slot_y - 115) for slot_x, slot_y in SP_JOIN_SLOT_CENTERS]
+        for match in belong_matches:
+            nearest = min(
+                anchor_points,
+                key=lambda anchor: abs(match.center[0] - anchor[0]) + abs(match.center[1] - anchor[1]),
+            )
+            dx = int(match.center[0] - nearest[0])
+            dy = int(match.center[1] - nearest[1])
+            if abs(dx) <= SP_JOIN_SLOT_OFFSET_MAX_DISTANCE and abs(dy) <= SP_JOIN_SLOT_OFFSET_MAX_DISTANCE:
+                candidate_offsets.append((dx, dy))
+
+        if not candidate_offsets:
+            return 0, 0
+
+        dx_values = sorted(offset[0] for offset in candidate_offsets)
+        dy_values = sorted(offset[1] for offset in candidate_offsets)
+        median_dx = dx_values[len(dx_values) // 2]
+        median_dy = dy_values[len(dy_values) // 2]
+        return median_dx, median_dy
 
     def scroll_sp_join_list_to_bottom(self) -> None:
         rect = self.bot.window.client_rect_screen()
@@ -638,7 +766,7 @@ class NewSeasonFlow:
                 self.bot.click_match(confirm, settle=0.25)
                 continue
 
-            next_step = self.bot.detect_new_season_step_in_screenshot(screenshot)
+            next_step = self.detect_step(screenshot)
             if next_step == "final_confirm":
                 logging.info("SP join follow-up advanced into final_confirm, continuing in the same new-season flow")
                 return self.run_final_confirm(assume_detected=True)
@@ -680,11 +808,11 @@ class NewSeasonFlow:
         time.sleep(SP_JOIN_SETTLE_SECONDS)
         if not self.run_sp_join_followup_confirms():
             return False
-        advanced, followup_screenshot = self._wait_for_expected_step("final_confirm", timeout=SP_JOIN_CONFIRM_HANDOFF_SECONDS)
-        if advanced:
-            logging.info("SP join handoff detected final_confirm")
-            return self.run_final_confirm(assume_detected=True)
-        return False
+        return self._continue_to_allowed_steps(
+            ("final_confirm", "creative_mode_main"),
+            SP_JOIN_CONFIRM_HANDOFF_SECONDS,
+            log_prefix="SP join",
+        )
 
     def run_final_confirm(self, assume_detected: bool = False) -> bool:
         self.mark_active()
@@ -720,7 +848,14 @@ class NewSeasonFlow:
                     )
                     if visible_followup is not None:
                         return bool(visible_followup)
-                    return False
+                    if self.bot.handle_story_dialog_fast(screenshot=fallback_screenshot, attempts=6):
+                        logging.info("Final confirm appears to have handed off into a story dialog, continuing inline cleanup")
+                        self.bot.last_final_confirm_time = time.time()
+                    elif self.bot.handle_post_schedule_events(max_clicks=6):
+                        logging.info("Final confirm appears to have handed off into a post-confirm story/event chain, continuing inline cleanup")
+                        self.bot.last_final_confirm_time = time.time()
+                    else:
+                        return False
         else:
             time.sleep(FINAL_CONFIRM_SETTLE_SECONDS)
             ok_chs = self.bot.vision.wait_for_any(["ok_chs_button"], min(self.bot.button_threshold, 0.72), timeout=2.5, interval=0.2)
@@ -743,6 +878,14 @@ class NewSeasonFlow:
             if self.handle_priority_confirm(timeout=0.2, settle=0.2):
                 continue
 
+            if self.bot.handle_story_dialog_fast(screenshot=screenshot, attempts=4):
+                logging.info("Final confirm handoff detected a story dialog, continuing to clear it inline")
+                continue
+
+            if self.bot.handle_post_schedule_events(max_clicks=6):
+                logging.info("Final confirm handoff detected a story/event chain, continuing to clear it inline")
+                continue
+
             if self.bot.find_final_confirm_screen_in_screenshot(screenshot):
                 now = time.time()
                 if now - last_fallback_click_time >= FINAL_CONFIRM_FALLBACK_CLICK_INTERVAL_SECONDS:
@@ -762,7 +905,7 @@ class NewSeasonFlow:
         elif not self.bot.check_runtime_health():
             return False
         current = screenshot if screenshot is not None else self.bot.vision.capture()
-        step = self.bot.detect_new_season_step_in_screenshot(current)
+        step = self.detect_step(current)
         if not step:
             return False
         return self._run_chain(initial_step=step, screenshot=current, fast_dispatch=fast_dispatch)

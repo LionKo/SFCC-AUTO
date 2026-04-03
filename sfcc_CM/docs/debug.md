@@ -38,6 +38,7 @@ stop_bot.bat
 - `flows/bootstrap_flow.py`: login -> main menu -> create entrance -> save selection
 - `flows/main_flow.py`: speed, special training, advance schedule
 - `flows/new_season_flow.py`: club transfers -> level -> SP join -> final confirm
+- `flows/recovery_flow.py`: light illegal-screen recovery (`ok/continue/back`)
 - `flows/common_flow.py`: ok, continue, skip, retry, close
 
 ## Smoke test status

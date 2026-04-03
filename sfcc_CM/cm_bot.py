@@ -23,8 +23,12 @@ import win32gui
 import win32process
 from ctypes import wintypes
 
-from flows import BootstrapFlow, CommonFlow, MainFlow, NewSeasonFlow, RecoveryFlow
-from templates import FLOW_TEMPLATE_GROUPS, TEMPLATE_PATHS, get_required_templates
+try:
+    from flows import BootstrapFlow, MainFlow, NewSeasonFlow, RecoveryFlow
+    from templates import FLOW_TEMPLATE_GROUPS, TEMPLATE_PATHS, get_required_templates
+except ModuleNotFoundError:
+    from .flows import BootstrapFlow, MainFlow, NewSeasonFlow, RecoveryFlow
+    from .templates import FLOW_TEMPLATE_GROUPS, TEMPLATE_PATHS, get_required_templates
 
 try:
     from rapidocr import RapidOCR
@@ -44,14 +48,16 @@ POST_SAVE_SELECTION_ENTRY_FASTLANE_SECONDS = 20.0
 NEW_SEASON_FASTLANE_SECONDS = 18.0
 SP_JOIN_POST_CONFIRM_FASTLANE_SECONDS = 90.0
 POST_SCHEDULE_EXCEPTION_FASTLANE_SECONDS = 90.0
+LEAGUE_RESULT_AFTERMATH_FASTLANE_SECONDS = 25.0
 EMERGENCY_PRIORITY_BUTTONS = ["close_button", "login_retry"]
 CONFIRM_BUTTONS = ["ok_button", "ok_button2", "ok_button3", "ok_chs_button"]
 CONTINUE_BUTTONS = ["continue_button", "continue_button2", "continue_button3"]
 STORY_SKIP_BUTTONS = ["skip_button", "skip_button2"]
-LIGHT_COMMON_BUTTONS = [*CONFIRM_BUTTONS, *CONTINUE_BUTTONS, *STORY_SKIP_BUTTONS]
+CLICKABLE_COMMON_BUTTONS = [*CONFIRM_BUTTONS, *CONTINUE_BUTTONS]
 EXCEPTION_CONFIRM_BUTTONS = ["final_confirm_ok_button", "final_confirm_ok_button2"]
-PRIORITY_BUTTONS = EMERGENCY_PRIORITY_BUTTONS + LIGHT_COMMON_BUTTONS + EXCEPTION_CONFIRM_BUTTONS
-EVENT_DIALOG_MARKERS = ["assistant", "log"]
+BOOTSTRAP_PRIORITY_BUTTONS = [*CONTINUE_BUTTONS]
+GUARD_PRIORITY_BUTTONS = [*EMERGENCY_PRIORITY_BUTTONS, *CLICKABLE_COMMON_BUTTONS, *EXCEPTION_CONFIRM_BUTTONS]
+EVENT_DIALOG_MARKERS = ["log", "log2"]
 EVENT_LOG_CHOOSE_MARKERS = ["event_choose_mark"]
 CONNECTING_MARKERS: list[str] = []
 CONNECTING_THRESHOLD = 0.68
@@ -71,6 +77,7 @@ MAIN_SCREEN_EXTRA_MARKERS = [
     "creative_mode_special_training_button3",
 ]
 STARTUP_RECOVERY_SECONDS = 60.0
+RECOVERY_DEFER_AFTER_VISUAL_CHANGE_SECONDS = 3.0
 SPEED_ALREADY_THREE_MARKERS = ["creative_mode_speed3"]
 SPEED_SWITCH_TRIGGER_BUTTONS = ["creative_mode_speed1"]
 MATCH_REWARD_SPEED_SWITCH_MARKERS = ["match_reward_speed1"]
@@ -127,7 +134,8 @@ SCREEN_STUCK_TIMEOUT_SECONDS = 120.0
 NO_SCHEDULE_TIMEOUT_SECONDS = 900.0
 BOOTSTRAP_TIMEOUT_SECONDS = 180.0
 BOOTSTRAP_POST_LOGIN_GAME_MAIN_SECONDS = 20.0
-VISUAL_STALL_TIMEOUT_SECONDS = 120.0
+STARTUP_RESOLUTION_GRACE_SECONDS = 20.0
+VISUAL_STALL_TIMEOUT_SECONDS = 60.0
 VISUAL_STALL_CHECK_INTERVAL_SECONDS = 5.0
 VISUAL_STALL_DIFF_THRESHOLD = 1.2
 RECOVERY_STORY_STREAK_RESET_SECONDS = 8.0
@@ -168,7 +176,6 @@ ACTIONABLE_OPERATION_MARKERS = [
     "continue_button",
     "continue_button2",
     "continue_button3",
-    "assistant",
     "log",
     "event_choose_mark",
     "skip_button",
@@ -254,6 +261,7 @@ REGION_FULL = ScreenRegion(0.0, 0.0, 1.0, 1.0)
 REGION_WIDE_TOP = ScreenRegion(0.0, 0.0, 1.0, 0.32)
 REGION_TOP_LEFT = ScreenRegion(0.0, 0.0, 0.38, 0.30)
 REGION_LOGIN_TOP_LEFT = ScreenRegion(0.0, 0.0, 0.45, 0.45)
+REGION_SPECIAL_TRAINING_RESULT_TOP_LEFT = ScreenRegion(0.0, 0.0, 0.34, 0.20)
 REGION_TOP_CENTER = ScreenRegion(0.22, 0.0, 0.78, 0.30)
 REGION_TOP_RIGHT = ScreenRegion(0.58, 0.0, 1.0, 0.28)
 REGION_LEFT_PANEL = ScreenRegion(0.0, 0.08, 0.34, 0.95)
@@ -262,8 +270,10 @@ REGION_CENTER_RIGHT = ScreenRegion(0.50, 0.10, 1.0, 0.92)
 REGION_BOTTOM_HALF = ScreenRegion(0.0, 0.55, 1.0, 1.0)
 REGION_BOTTOM_LEFT = ScreenRegion(0.0, 0.50, 0.22, 1.0)
 REGION_BOTTOM_RIGHT = ScreenRegion(0.56, 0.56, 1.0, 1.0)
+REGION_CONFIRM_CHAIN = ScreenRegion(0.46, 0.48, 1.0, 1.0)
 REGION_SCHEDULE_BUTTON = ScreenRegion(0.76, 0.74, 0.99, 0.99)
 SPECIAL_TRAINING_ACTION_REGION = ScreenRegion(0.24, 0.52, 0.86, 0.94)
+SPECIAL_TRAINING_EXECUTE_REGION = ScreenRegion(0.72, 0.78, 1.0, 1.0)
 
 INPUT_MOUSE = 0
 
@@ -400,9 +410,18 @@ class GameWindow:
         if self.hwnd is None:
             self.attach()
         assert self.hwnd is not None
-        left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
-        screen_left, screen_top = win32gui.ClientToScreen(self.hwnd, (left, top))
-        screen_right, screen_bottom = win32gui.ClientToScreen(self.hwnd, (right, bottom))
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            screen_left, screen_top = win32gui.ClientToScreen(self.hwnd, (left, top))
+            screen_right, screen_bottom = win32gui.ClientToScreen(self.hwnd, (right, bottom))
+        except Exception as exc:
+            logging.warning("Game window handle %s became invalid while reading the client rect, reattaching once: %s", self.hwnd, exc)
+            self.hwnd = None
+            self.attach()
+            assert self.hwnd is not None
+            left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            screen_left, screen_top = win32gui.ClientToScreen(self.hwnd, (left, top))
+            screen_right, screen_bottom = win32gui.ClientToScreen(self.hwnd, (right, bottom))
         return {
             "left": screen_left,
             "top": screen_top,
@@ -878,6 +897,8 @@ class CreativeModeBot:
         self.last_stage_change_time = now
         self.last_stage_probe_time = 0.0
         self.last_full_stage_scan_time = 0.0
+        self.last_stage_probe_screenshot: np.ndarray | None = None
+        self.last_stage_probe_detected_stage = "unknown"
         self.restart_requested = False
         self.restart_reason = ""
         self.awaiting_save_selection = False
@@ -886,10 +907,14 @@ class CreativeModeBot:
         self.last_save_selection_click_time = 0.0
         self.last_new_season_activity_time = 0.0
         self.last_final_confirm_time = 0.0
+        self.last_league_result_time = 0.0
         self.last_generic_confirm_click_time = 0.0
+        self.last_league_result_fallback_time = 0.0
         self.last_special_training_run_time = 0.0
         self.last_club_transfers_min_click_time = 0.0
         self.last_bootstrap_login_click_time = 0.0
+        self.last_startup_back_escape_click_time = 0.0
+        self.startup_resolution_grace_until = 0.0
         self.special_training_unavailable_until = 0.0
         self.recovery_story_streak = 0
         self.last_recovery_story_seen_time = 0.0
@@ -898,7 +923,6 @@ class CreativeModeBot:
         self.last_visual_change_time = now
         self.last_visual_signature: np.ndarray | None = None
         self._frame_eval_cache: dict[tuple[int, str, object], object] = {}
-        self.common_flow = CommonFlow(self)
         self.bootstrap_flow = BootstrapFlow(self)
         self.main_flow = MainFlow(self)
         self.new_season_flow = NewSeasonFlow(self)
@@ -924,7 +948,16 @@ class CreativeModeBot:
         self.last_stage_signature = new_stage
         self.last_stage_change_time = now
         self.last_stage_probe_time = 0.0
+        self.last_stage_probe_screenshot = None
+        self.last_stage_probe_detected_stage = new_stage
         logging.info("Runtime stage invalidated because %s", reason)
+
+    def get_recent_stage_probe(self, max_age_seconds: float = 1.0) -> tuple[str, np.ndarray | None]:
+        if self.last_stage_probe_screenshot is None:
+            return self.last_stage_probe_detected_stage, None
+        if time.time() - self.last_stage_probe_time > max_age_seconds:
+            return self.last_stage_probe_detected_stage, None
+        return self.last_stage_probe_detected_stage, self.last_stage_probe_screenshot
 
     def _pick_best_match(self, *matches: MatchResult | None) -> MatchResult | None:
         available = [match for match in matches if match is not None]
@@ -986,6 +1019,81 @@ class CreativeModeBot:
             return self._get_frame_cached(screenshot, "ocr_title", cache_key)  # type: ignore[return-value]
         result = self.vision.find_text_in_region(screenshot, text_tuple, region, min_score=min_score)
         return self._set_frame_cached(screenshot, "ocr_title", result, cache_key)  # type: ignore[return-value]
+
+    def _match_preprocessed_ocr_title(
+        self,
+        screenshot: np.ndarray,
+        texts: Iterable[str],
+        region: ScreenRegion,
+        *,
+        min_score: float = 0.30,
+        upscale_factor: float = 3.0,
+    ) -> MatchResult | None:
+        text_tuple = tuple(texts)
+        cache_key = (
+            text_tuple,
+            region.left_ratio,
+            region.top_ratio,
+            region.right_ratio,
+            region.bottom_ratio,
+            round(min_score, 3),
+            round(upscale_factor, 2),
+        )
+        if self._has_frame_cached(screenshot, "ocr_title_preprocessed", cache_key):
+            return self._get_frame_cached(screenshot, "ocr_title_preprocessed", cache_key)  # type: ignore[return-value]
+
+        cropped, offset_x, offset_y = self.vision.crop_to_region(screenshot, region)
+        if cropped.size == 0:
+            return self._set_frame_cached(screenshot, "ocr_title_preprocessed", None, cache_key)  # type: ignore[return-value]
+
+        gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+        normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        upscaled = cv2.resize(
+            normalized,
+            None,
+            fx=upscale_factor,
+            fy=upscale_factor,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        _, thresholded = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        ocr_result = self.vision.ocr(cv2.cvtColor(thresholded, cv2.COLOR_GRAY2BGR))
+        if ocr_result is None:
+            return self._set_frame_cached(screenshot, "ocr_title_preprocessed", None, cache_key)  # type: ignore[return-value]
+
+        target_map = {
+            self.vision._normalize_ocr_text(text): text
+            for text in text_tuple
+            if self.vision._normalize_ocr_text(text)
+        }
+        best: MatchResult | None = None
+        for box, detected_text, score in self.vision._extract_ocr_lines(ocr_result):
+            normalized_detected = self.vision._normalize_ocr_text(detected_text)
+            if not normalized_detected:
+                continue
+            matched = False
+            for normalized_target in target_map:
+                if normalized_target in normalized_detected or normalized_detected in normalized_target:
+                    matched = True
+                    break
+            if not matched:
+                continue
+            score = float(score)
+            if score < min_score:
+                continue
+            xs = box[:, 0] / upscale_factor
+            ys = box[:, 1] / upscale_factor
+            candidate = MatchResult(
+                name=f"ocr-preprocessed:{detected_text}",
+                score=score,
+                left=int(max(0.0, np.min(xs))) + offset_x,
+                top=int(max(0.0, np.min(ys))) + offset_y,
+                width=max(1, int(np.max(xs) - np.min(xs))),
+                height=max(1, int(np.max(ys) - np.min(ys))),
+            )
+            if best is None or candidate.score > best.score:
+                best = candidate
+
+        return self._set_frame_cached(screenshot, "ocr_title_preprocessed", best, cache_key)  # type: ignore[return-value]
 
     def _candidate_steam_paths(self) -> list[Path]:
         candidates: list[Path] = []
@@ -1103,6 +1211,8 @@ class CreativeModeBot:
             self.last_stage_change_time = now
             self.last_stage_probe_time = 0.0
             self.last_full_stage_scan_time = 0.0
+            self.last_stage_probe_screenshot = None
+            self.last_stage_probe_detected_stage = "restarted"
             self.last_advance_schedule_click_time = 0.0
             self.window.last_click_time = now
             self.awaiting_save_selection = False
@@ -1114,6 +1224,7 @@ class CreativeModeBot:
             self.last_special_training_run_time = 0.0
             self.last_club_transfers_min_click_time = 0.0
             self.last_bootstrap_login_click_time = 0.0
+            self.startup_resolution_grace_until = now + STARTUP_RESOLUTION_GRACE_SECONDS
             self.special_training_unavailable_until = 0.0
             self.recovery_story_streak = 0
             self.last_recovery_story_seen_time = 0.0
@@ -1187,46 +1298,52 @@ class CreativeModeBot:
         )
 
     def find_special_training_result_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
-        title = self._match_ocr_title(
+        return self._match_ocr_title(
             screenshot,
             OCR_TEXT_SPECIAL_TRAINING_RESULT,
-            REGION_WIDE_TOP,
+            REGION_SPECIAL_TRAINING_RESULT_TOP_LEFT,
             min_score=0.35,
         ) or self._match_ocr_title(
             screenshot,
             OCR_TEXT_SPECIAL_TRAINING_RESULT,
             REGION_LOGIN_TOP_LEFT,
             min_score=0.35,
-        )
-        if not title:
-            return None
-        back_button = self.vision.match_best_in_region(
+        ) or self._match_preprocessed_ocr_title(
             screenshot,
-            BACK_BUTTONS,
-            min(self.button_threshold, 0.72),
-            REGION_TOP_LEFT,
+            OCR_TEXT_SPECIAL_TRAINING_RESULT,
+            REGION_SPECIAL_TRAINING_RESULT_TOP_LEFT,
+            min_score=0.30,
         )
-        confirm_button = self.vision.match_best(
-            screenshot,
-            CONFIRM_BUTTONS + CONTINUE_BUTTONS,
-            min(self.button_threshold, 0.68),
-        )
-        return self._pick_best_match(title, back_button, confirm_button)
 
-    def find_special_training_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
-        title = self.find_special_training_title_in_screenshot(screenshot)
-        if not title:
-            return self.find_special_training_result_screen_in_screenshot(screenshot)
-
-        action = self.vision.match_best(
+    def find_special_training_settings_markers_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
+        action = self.vision.match_best_in_region(
             screenshot,
             [
                 *SPECIAL_TRAINING_RESET_BUTTONS,
                 *SPECIAL_TRAINING_RECOMMEND_BUTTONS,
                 *SPECIAL_TRAINING_EXECUTE_BUTTONS,
             ],
-            min(self.button_threshold, 0.78),
+            min(self.button_threshold, 0.76),
+            SPECIAL_TRAINING_ACTION_REGION,
         )
+        back_button = self.vision.match_best_in_region(
+            screenshot,
+            BACK_BUTTONS,
+            min(self.button_threshold, 0.72),
+            REGION_TOP_LEFT,
+        )
+        if action and back_button:
+            return self._pick_best_match(action, back_button)
+        if action and action.score >= max(min(self.button_threshold, 0.90), 0.90):
+            return action
+        return None
+
+    def find_special_training_screen_in_screenshot(self, screenshot: np.ndarray) -> MatchResult | None:
+        title = self.find_special_training_title_in_screenshot(screenshot)
+        if not title:
+            return self.find_special_training_result_screen_in_screenshot(screenshot)
+
+        action = self.find_special_training_settings_markers_in_screenshot(screenshot)
         back_button = self.vision.match_best_in_region(
             screenshot,
             BACK_BUTTONS,
@@ -1250,9 +1367,6 @@ class CreativeModeBot:
             min(self.button_threshold, 0.80),
             REGION_BOTTOM_RIGHT,
         )
-        if not renewal_button:
-            return self._set_frame_cached(screenshot, "club_transfers_screen", None)  # type: ignore[return-value]
-
         title = self._match_ocr_title(
             screenshot,
             OCR_TEXT_CLUB_TRANSFERS,
@@ -1264,9 +1378,8 @@ class CreativeModeBot:
             REGION_LOGIN_TOP_LEFT,
             min_score=0.35,
         )
-        if title:
-            return self._set_frame_cached(screenshot, "club_transfers_screen", self._pick_best_match(title, renewal_button))  # type: ignore[return-value]
-        return self._set_frame_cached(screenshot, "club_transfers_screen", None)  # type: ignore[return-value]
+        result = self._pick_best_match(title, renewal_button)
+        return self._set_frame_cached(screenshot, "club_transfers_screen", result)  # type: ignore[return-value]
 
     def is_club_transfers_screen(self) -> MatchResult | None:
         screenshot = self.vision.capture()
@@ -1456,6 +1569,25 @@ class CreativeModeBot:
             ],
             min_strong=1,
         )
+        if result:
+            conflicting_stage = self._pick_best_match(
+                self.find_game_main_screen_in_screenshot(screenshot),
+                self.find_main_screen_in_screenshot(screenshot),
+                self.find_save_selection_screen_in_screenshot(screenshot),
+                self.find_special_training_screen_in_screenshot(screenshot),
+                self.find_club_transfers_screen_in_screenshot(screenshot),
+                self.find_club_transfers_level_screen_in_screenshot(screenshot),
+                self.find_sp_join_screen_in_screenshot(screenshot),
+                self.find_final_confirm_screen_in_screenshot(screenshot),
+            )
+            if conflicting_stage and conflicting_stage.score >= max(0.60, result.score):
+                logging.info(
+                    "Ignoring login-screen match %s (score=%.3f) because a more specific screen marker is also visible (score=%.3f)",
+                    result.name,
+                    result.score,
+                    conflicting_stage.score,
+                )
+                result = None
         return self._set_frame_cached(screenshot, "login_screen", result)  # type: ignore[return-value]
 
     def is_game_main_screen(self) -> MatchResult | None:
@@ -1537,7 +1669,7 @@ class CreativeModeBot:
                         shot,
                         EVENT_DIALOG_MARKERS,
                         min(self.dialog_threshold, 0.72),
-                        REGION_LEFT_PANEL,
+                        REGION_TOP_RIGHT,
                     ),
                 ),
             ],
@@ -1653,7 +1785,7 @@ class CreativeModeBot:
             screenshot,
             EVENT_DIALOG_MARKERS,
             threshold=min(self.dialog_threshold, 0.72),
-            region=REGION_LEFT_PANEL,
+            region=REGION_TOP_RIGHT,
         ):
             return "event_dialog"
         if self.vision.match_best_in_region(
@@ -1675,6 +1807,8 @@ class CreativeModeBot:
         screenshot = self.vision.capture()
         stage = self.detect_stage_signature(screenshot, flow_hint=self.active_flow, allow_broad_fallback=False)
         self.last_stage_probe_time = now
+        self.last_stage_probe_screenshot = screenshot
+        self.last_stage_probe_detected_stage = stage
 
         if (
             stage == "unknown"
@@ -1689,6 +1823,7 @@ class CreativeModeBot:
             if allow_full_scan and (force or self.active_flow == "recovery" or now - self.last_full_stage_scan_time >= FULL_STAGE_SCAN_INTERVAL_SECONDS):
                 stage = self.detect_stage_signature(screenshot, flow_hint=self.active_flow, allow_broad_fallback=True)
                 self.last_full_stage_scan_time = now
+                self.last_stage_probe_detected_stage = stage
             elif cached_stage == "unknown" and now - self.last_stage_probe_time < STAGE_SCAN_UNKNOWN_INTERVAL_SECONDS:
                 return cached_stage
 
@@ -1749,10 +1884,19 @@ class CreativeModeBot:
         try:
             rect = self.window.client_rect_screen()
             if not self.is_expected_client_size(rect["width"], rect["height"]):
-                self.request_restart(
-                    f"unexpected resolution {rect['width']}x{rect['height']} (expected {EXPECTED_CLIENT_WIDTH}x{EXPECTED_CLIENT_HEIGHT})"
-                )
-                return False
+                if time.time() < self.startup_resolution_grace_until:
+                    logging.info(
+                        "Startup resolution grace is active for %.0fs more; tolerating transient resolution %sx%s while waiting for the game window to settle",
+                        max(0.0, self.startup_resolution_grace_until - time.time()),
+                        rect["width"],
+                        rect["height"],
+                    )
+                    rect = None
+                else:
+                    self.request_restart(
+                        f"unexpected resolution {rect['width']}x{rect['height']} (expected {EXPECTED_CLIENT_WIDTH}x{EXPECTED_CLIENT_HEIGHT})"
+                    )
+                    return False
         except Exception as exc:
             logging.debug("Resolution check failed during health check: %s", exc)
 
@@ -1794,6 +1938,14 @@ class CreativeModeBot:
         try:
             rect = self.window.client_rect_screen()
             if not self.is_expected_client_size(rect["width"], rect["height"]):
+                if time.time() < self.startup_resolution_grace_until:
+                    logging.info(
+                        "Startup resolution grace is active for %.0fs more; tolerating transient resolution %sx%s while waiting for the game window to settle",
+                        max(0.0, self.startup_resolution_grace_until - time.time()),
+                        rect["width"],
+                        rect["height"],
+                    )
+                    return True
                 self.request_restart(
                     f"unexpected resolution {rect['width']}x{rect['height']} (expected {EXPECTED_CLIENT_WIDTH}x{EXPECTED_CLIENT_HEIGHT})"
                 )
@@ -1882,7 +2034,8 @@ class CreativeModeBot:
         return None
 
     def _find_allowed_light_common_button(self, screenshot: np.ndarray, priority_threshold: float) -> MatchResult | None:
-        candidates = self.vision.match_all(screenshot, LIGHT_COMMON_BUTTONS + BACK_BUTTONS, priority_threshold, max_matches=12)
+        candidate_names = BOOTSTRAP_PRIORITY_BUTTONS if self.active_flow == "bootstrap" else CLICKABLE_COMMON_BUTTONS
+        candidates = self.vision.match_all(screenshot, candidate_names, priority_threshold, max_matches=12)
         for candidate in candidates:
             reason = self._secondary_button_exclusion_reason(screenshot, candidate.name)
             if reason:
@@ -1891,7 +2044,7 @@ class CreativeModeBot:
             return candidate
         return None
 
-    def _handle_global_priority_buttons_from_screenshot(self, screenshot: np.ndarray, priority_threshold: float) -> bool:
+    def _handle_bootstrap_continue_buttons_from_screenshot(self, screenshot: np.ndarray, priority_threshold: float) -> bool:
         common_button = self._find_allowed_light_common_button(screenshot, priority_threshold)
         if common_button:
             logging.info(
@@ -1909,56 +2062,8 @@ class CreativeModeBot:
     def _handle_exception_layer_from_screenshot(self, screenshot: np.ndarray, priority_threshold: float) -> bool:
         confirm_button = self.vision.match_best(screenshot, EXCEPTION_CONFIRM_BUTTONS, priority_threshold)
         if confirm_button:
-            level_screen = self._match_ocr_title(
-                screenshot,
-                OCR_TEXT_CLUB_TRANSFERS_LEVEL,
-                REGION_WIDE_TOP,
-                min_score=0.35,
-            )
-            min_button = self.vision.match_best(
-                screenshot,
-                ["club_transfers_min_button"],
-                max(min(self.button_threshold, 0.72), 0.82),
-            )
-            if level_screen and min_button:
-                logging.info(
-                    "Exception layer detected club-transfers level confirm %s, selecting minimum difficulty first",
-                    confirm_button.name,
-                )
-                self.click_match(min_button, settle=0.3)
-                screenshot = self.vision.capture()
-                refreshed_confirm = self.vision.match_best(screenshot, EXCEPTION_CONFIRM_BUTTONS, priority_threshold)
-                if not refreshed_confirm:
-                    logging.warning("Exception-layer confirm button disappeared after selecting minimum difficulty")
-                    return True
-                confirm_button = refreshed_confirm
-
             logging.info("Exception-layer confirm button detected: %s (score=%.3f)", confirm_button.name, confirm_button.score)
             self.click_match(confirm_button, settle=0.2)
-            return True
-
-        new_season_step = self.detect_new_season_step_in_screenshot(screenshot)
-        if new_season_step:
-            if new_season_step == "sp_join":
-                logging.info("Exception layer detected new-season step sp_join, dispatching immediately to staged flow handling")
-                self.set_active_flow("new_season")
-                return self.new_season_flow.run(screenshot, fast_dispatch=True)
-            logging.info("Exception layer detected new-season step %s, deferring to staged flow handling", new_season_step)
-            return False
-
-        # Avoid story/event-choice false positives on obvious main screens.
-        if self.find_main_screen_in_screenshot(screenshot) or self.should_trust_main_screen(screenshot):
-            return False
-
-        event_choice = self.find_event_choice_in_screenshot(screenshot)
-        if event_choice:
-            logging.info(
-                "Exception layer detected event choice via %s (score=%.3f), selecting the first option",
-                event_choice.name,
-                event_choice.score,
-            )
-            self.click_event_log_first_option(settle=0.15)
-            self.rapidly_advance_event_story(attempts=4, settle=0.08)
             return True
 
         return False
@@ -1998,6 +2103,45 @@ class CreativeModeBot:
         self.click_match(emergency_button, settle=0.2)
         return True
 
+    def _handle_close_button_interrupt_from_screenshot(self, screenshot: np.ndarray, priority_threshold: float) -> bool:
+        close_button = self.vision.match_best(screenshot, ["close_button"], priority_threshold)
+        if not close_button:
+            return False
+        logging.info(
+            "Close button detected during story/event handling and dismissed immediately: %s (score=%.3f)",
+            close_button.name,
+            close_button.score,
+        )
+        self.click_match(close_button, settle=0.15)
+        return True
+
+    def _handle_post_schedule_ok_interrupt_from_screenshot(self, screenshot: np.ndarray, priority_threshold: float) -> bool:
+        quick_button = self.vision.match_best_in_region(
+            screenshot,
+            [
+                "ok_button",
+                "ok_button2",
+                "ok_button3",
+                "ok_chs_button",
+                "continue_button",
+                "continue_button2",
+                "continue_button3",
+                "final_confirm_ok_button",
+                "final_confirm_ok_button2",
+            ],
+            priority_threshold,
+            REGION_CONFIRM_CHAIN,
+        )
+        if not quick_button:
+            return False
+        logging.info(
+            "Post-schedule confirm interrupt detected and handled immediately: %s (score=%.3f)",
+            quick_button.name,
+            quick_button.score,
+        )
+        self.click_match(quick_button, settle=0.15)
+        return True
+
     def handle_emergency_buttons(self, max_clicks: int = 2, initial_screenshot: np.ndarray | None = None) -> bool:
         handled_any = False
         priority_threshold = min(self.button_threshold, 0.72)
@@ -2012,7 +2156,7 @@ class CreativeModeBot:
             screenshot = None
         return handled_any
 
-    def handle_global_priority_buttons(self, max_clicks: int = 4, initial_screenshot: np.ndarray | None = None) -> bool:
+    def handle_bootstrap_continue_buttons(self, max_clicks: int = 4, initial_screenshot: np.ndarray | None = None) -> bool:
         handled_any = False
         priority_threshold = min(self.button_threshold, 0.72)
         screenshot = initial_screenshot
@@ -2020,7 +2164,7 @@ class CreativeModeBot:
             self.window.move_cursor_client(x_ratio=0.08, y_ratio=0.08)
             if screenshot is None or attempt > 0:
                 screenshot = self.vision.capture()
-            if not self._handle_global_priority_buttons_from_screenshot(screenshot, priority_threshold):
+            if not self._handle_bootstrap_continue_buttons_from_screenshot(screenshot, priority_threshold):
                 break
             handled_any = True
             screenshot = None
@@ -2040,34 +2184,11 @@ class CreativeModeBot:
             screenshot = None
         return handled_any
 
-    def handle_common_layers_once(self, screenshot: np.ndarray | None = None, max_clicks: int = 1) -> bool:
-        handled_any = False
-        priority_threshold = min(self.button_threshold, 0.72)
-        current_screenshot = screenshot
-        for attempt in range(max_clicks):
-            self.window.move_cursor_client(x_ratio=0.08, y_ratio=0.08)
-            if current_screenshot is None or attempt > 0:
-                current_screenshot = self.vision.capture()
-            if self._handle_emergency_buttons_from_screenshot(current_screenshot, priority_threshold):
-                handled_any = True
-                current_screenshot = None
-                continue
-            if self._handle_exception_layer_from_screenshot(current_screenshot, priority_threshold):
-                handled_any = True
-                current_screenshot = None
-                continue
-            if self._handle_global_priority_buttons_from_screenshot(current_screenshot, priority_threshold):
-                handled_any = True
-                current_screenshot = None
-                continue
-            break
-        return handled_any
-
     def has_priority_button_visible(self) -> bool:
         self.window.move_cursor_client(x_ratio=0.08, y_ratio=0.08)
         screenshot = self.vision.capture()
         priority_threshold = min(self.button_threshold, 0.72)
-        return self.vision.match_best(screenshot, PRIORITY_BUTTONS, priority_threshold) is not None
+        return self.vision.match_best(screenshot, GUARD_PRIORITY_BUTTONS, priority_threshold) is not None
 
     def fallback_click_when_no_operation_found(self) -> bool:
         match = self.find_any_known_operation()
@@ -2134,11 +2255,15 @@ class CreativeModeBot:
                 logging.info("Event flow finished and main screen returned")
                 return True
             screenshot = self.vision.capture()
+            if self._handle_close_button_interrupt_from_screenshot(screenshot, min(self.button_threshold, 0.72)):
+                screenshot = self.vision.capture()
             if self._handle_fast_story_transition_from_screenshot(screenshot):
                 return True
             logging.info("Rapid story left click %s/%s", rapid_click, attempts)
             self.window.click_client_center(settle=settle)
             screenshot = self.vision.capture()
+            if self._handle_close_button_interrupt_from_screenshot(screenshot, min(self.button_threshold, 0.72)):
+                screenshot = self.vision.capture()
             if self._handle_fast_story_transition_from_screenshot(screenshot):
                 return True
         if self.is_main_screen():
@@ -2204,6 +2329,8 @@ class CreativeModeBot:
 
     def handle_story_dialog_fast(self, screenshot: np.ndarray | None = None, attempts: int = 4) -> bool:
         screenshot = screenshot if screenshot is not None else self.vision.capture()
+        if self._handle_close_button_interrupt_from_screenshot(screenshot, min(self.button_threshold, 0.72)):
+            screenshot = self.vision.capture()
         log_match = self.vision.match_best_in_region(
             screenshot,
             ["log", "log2"],
@@ -2224,11 +2351,15 @@ class CreativeModeBot:
             logging.info("Story dialog skip detected: %s (score=%.3f)", skip_button.name, skip_button.score)
             self.click_match(skip_button, settle=0.08)
             screenshot = self.vision.capture()
+            if self._handle_close_button_interrupt_from_screenshot(screenshot, min(self.button_threshold, 0.72)):
+                screenshot = self.vision.capture()
             if self._handle_fast_story_transition_from_screenshot(screenshot):
                 return True
 
         for attempt in range(1, attempts + 1):
             screenshot = self.vision.capture()
+            if self._handle_close_button_interrupt_from_screenshot(screenshot, min(self.button_threshold, 0.72)):
+                screenshot = self.vision.capture()
             if self._handle_fast_story_transition_from_screenshot(screenshot):
                 return True
 
@@ -2247,6 +2378,9 @@ class CreativeModeBot:
         return True
 
     def _handle_fast_story_transition_from_screenshot(self, screenshot: np.ndarray) -> bool:
+        if self._handle_close_button_interrupt_from_screenshot(screenshot, min(self.button_threshold, 0.72)):
+            return True
+
         if self.is_main_screen_returned_quickly(screenshot) or self.should_trust_main_screen(screenshot):
             logging.info("Event flow finished and creative mode main screen is already visible")
             return True
@@ -2289,11 +2423,14 @@ class CreativeModeBot:
         logging.info("Clicking main-screen special training hotspot at (%s, %s)", x, y)
         self.window.click_client(x, y, settle=settle)
 
-    def click_special_training_back_hotspot(self, settle: float = 0.35) -> None:
+    def click_back_hotspot(self, settle: float = 0.35) -> None:
         x = max(1, int(EXPECTED_CLIENT_WIDTH * 0.036))
         y = max(1, int(EXPECTED_CLIENT_HEIGHT * 0.050))
-        logging.info("Clicking special-training back hotspot at (%s, %s)", x, y)
+        logging.info("Clicking top-left back hotspot at (%s, %s)", x, y)
         self.window.click_client(x, y, settle=settle)
+
+    def click_special_training_back_hotspot(self, settle: float = 0.35) -> None:
+        self.click_back_hotspot(settle=settle)
 
     def click_main_screen_schedule_hotspot(self, variant: int = 0, settle: float = 0.5) -> None:
         x_ratio, y_ratio = MAIN_SCREEN_SCHEDULE_RATIOS[min(max(variant, 0), len(MAIN_SCREEN_SCHEDULE_RATIOS) - 1)]
@@ -2355,6 +2492,10 @@ class CreativeModeBot:
             return False
         if self.find_match_reward_screen_in_screenshot(screenshot):
             return False
+        if self._match_ocr_title(screenshot, ("梦幻球队", "赛季结果"), REGION_WIDE_TOP, min_score=0.35):
+            return False
+        if self._match_ocr_title(screenshot, OCR_TEXT_LEAGUE_RESULT, REGION_WIDE_TOP, min_score=0.35):
+            return False
         if self.find_club_transfers_screen_in_screenshot(screenshot):
             return False
         if self.find_club_transfers_level_screen_in_screenshot(screenshot):
@@ -2407,7 +2548,7 @@ class CreativeModeBot:
             screenshot,
             EVENT_DIALOG_MARKERS,
             max(min(self.dialog_threshold, 0.68), 0.68),
-            REGION_LEFT_PANEL,
+            REGION_TOP_RIGHT,
         )
         skip = self.vision.match_best(
             screenshot,
@@ -2561,7 +2702,7 @@ class CreativeModeBot:
         if not speed_one:
             speed_one = self.vision.match_best(
                 screenshot,
-                SPEED_SWITCH_TRIGGER_BUTTONS + MATCH_REWARD_SPEED_SWITCH_MARKERS,
+                SPEED_SWITCH_TRIGGER_BUTTONS,
                 speed_one_threshold,
             )
 
@@ -2588,30 +2729,31 @@ class CreativeModeBot:
             return True
 
         if speed_state != "one" or not speed_marker:
-            loose_speed_one_threshold = min(SPEED_ONE_THRESHOLD, 0.55 if prefer_reward_context else 0.50)
+            loose_speed_one_threshold = min(SPEED_ONE_THRESHOLD, 0.62 if prefer_reward_context else 0.60)
+            loose_speed_three_threshold = min(SPEED_THREE_CONFIRM_THRESHOLD, 0.75)
             speed_state_loose, speed_marker_loose = self.detect_speed_state(
                 screenshot,
                 prefer_reward_context=prefer_reward_context,
                 speed_one_threshold=loose_speed_one_threshold,
-                speed_three_threshold=min(SPEED_THREE_CONFIRM_THRESHOLD, 0.50),
+                speed_three_threshold=loose_speed_three_threshold,
             )
             speed_one_loose = speed_marker_loose if speed_state_loose == "one" else None
             speed_three_loose = speed_marker_loose if speed_state_loose == "three" else None
-            if speed_one_loose:
-                speed_marker = speed_one_loose
-            if speed_one_loose:
+            if speed_three_loose:
                 logging.info(
-                    "Speed switch skipped: speed1-like marker %s seen but below confident threshold (score=%.3f, required=%.3f)",
-                    speed_one_loose.name,
-                    speed_one_loose.score,
-                    SPEED_ONE_THRESHOLD,
-                )
-            elif speed_three_loose:
-                logging.info(
-                    "Speed switch skipped: speed3-like marker %s seen but below confident threshold (score=%.3f, required=%.3f)",
+                    "3x speed already appears active via %s with a relaxed threshold (score=%.3f, required=%.3f)",
                     speed_three_loose.name,
                     speed_three_loose.score,
-                    SPEED_THREE_CONFIRM_THRESHOLD,
+                    loose_speed_three_threshold,
+                )
+                return True
+            if speed_one_loose:
+                speed_marker = speed_one_loose
+                logging.info(
+                    "Speed switch will proceed because speed1-like marker %s was found with a relaxed threshold (score=%.3f, required=%.3f)",
+                    speed_one_loose.name,
+                    speed_one_loose.score,
+                    loose_speed_one_threshold,
                 )
             else:
                 logging.info("Speed switch skipped: no speed1/speed3 marker was confidently detected on the current screen")
@@ -2680,10 +2822,10 @@ class CreativeModeBot:
 
     def handle_speed_one_anywhere(self) -> bool:
         screenshot = self.vision.capture()
-        priority_match = self.vision.match_best(screenshot, PRIORITY_BUTTONS, min(self.button_threshold, 0.72))
+        priority_match = self.vision.match_best(screenshot, GUARD_PRIORITY_BUTTONS, min(self.button_threshold, 0.72))
         if priority_match:
             logging.debug(
-                "Deferring speed switch because priority button %s is visible (score=%.3f)",
+                "Deferring speed switch because guard button %s is visible (score=%.3f)",
                 priority_match.name,
                 priority_match.score,
             )
@@ -2732,7 +2874,7 @@ class CreativeModeBot:
             screenshot = self.vision.capture()
         priority_threshold = min(self.button_threshold, 0.72)
 
-        emergency = self.vision.match_best(screenshot, EMERGENCY_PRIORITY_BUTTONS, priority_threshold)
+        emergency = self.vision.match_best(screenshot, ["close_button"], priority_threshold)
         if emergency:
             logging.info("Fast main-screen interrupt detected: %s (score=%.3f)", emergency.name, emergency.score)
             self.click_match(emergency, settle=0.2)
@@ -2867,6 +3009,9 @@ class CreativeModeBot:
 
             self.window.move_cursor_client(x_ratio=0.08, y_ratio=0.08)
             screenshot = self.vision.capture()
+            if self._handle_close_button_interrupt_from_screenshot(screenshot, min(self.button_threshold, 0.72)):
+                handled = True
+                continue
             confirm_button = self.vision.match_best(screenshot, CONFIRM_BUTTONS, min(self.button_threshold, 0.72))
             if confirm_button:
                 handled = True
@@ -2899,7 +3044,13 @@ class CreativeModeBot:
                 if self.rapidly_advance_event_story(attempts=4, settle=0.08):
                     return True
 
-            event = self.vision.wait_for_any(EVENT_DIALOG_MARKERS, event_threshold, timeout=0.12, interval=0.05)
+            event = self.wait_for_any_in_region(
+                EVENT_DIALOG_MARKERS,
+                event_threshold,
+                REGION_TOP_RIGHT,
+                timeout=0.12,
+                interval=0.05,
+            )
             if not event and not skip_button:
                 return handled
 
@@ -2952,13 +3103,13 @@ class CreativeModeBot:
 
     def handle_league_result_screen(self, max_clicks: int = 6) -> bool:
         handled = False
-        threshold = 0.70
+        season_end_titles = (*OCR_TEXT_LEAGUE_RESULT, "梦幻球队", "赛季结果")
         for attempt in range(1, max_clicks + 1):
             if not self.check_runtime_process_only():
                 return handled
 
             title = self.wait_for_ocr_text_in_region(
-                OCR_TEXT_LEAGUE_RESULT,
+                season_end_titles,
                 REGION_WIDE_TOP,
                 timeout=0.25,
                 interval=0.1,
@@ -2968,6 +3119,7 @@ class CreativeModeBot:
                 return handled
 
             handled = True
+            self.last_league_result_time = time.time()
             button = self.vision.wait_for_any(
                 LEAGUE_RESULT_CONTINUE_BUTTONS,
                 threshold=min(self.button_threshold, 0.55),
@@ -2977,9 +3129,19 @@ class CreativeModeBot:
             if button:
                 logging.info("League result screen detected, clicking continue on attempt %s", attempt)
                 self.click_match(button, settle=0.25)
-            else:
-                logging.info("League result screen detected, continue button not matched, using bottom-right click attempt %s", attempt)
+            elif attempt >= 2:
+                self.last_league_result_fallback_time = time.time()
+                logging.info(
+                    "League result screen detected, continue button still not matched, using bottom-right click attempt %s",
+                    attempt,
+                )
                 self.window.click_client_bottom_right(settle=0.2)
+            else:
+                logging.info(
+                    "League result screen detected, continue button not matched on attempt %s; waiting for a direct continue button instead of using bottom-right fallback",
+                    attempt,
+                )
+                time.sleep(0.25)
 
             if self.is_main_screen():
                 logging.info("League result screen cleared and creative mode main screen returned")
@@ -3130,11 +3292,36 @@ class CreativeModeBot:
     def run_new_season_flow(self, screenshot: np.ndarray | None = None) -> bool:
         return self.new_season_flow.run(screenshot)
 
+    def should_defer_recovery_for_recent_visual_change(
+        self,
+        *,
+        context: str,
+        settle_seconds: float = RECOVERY_DEFER_AFTER_VISUAL_CHANGE_SECONDS,
+        absolute_timeout_seconds: float | None = None,
+        reference_time: float | None = None,
+    ) -> bool:
+        now = time.time()
+        since_visual_change = now - self.last_visual_change_time
+        if since_visual_change >= settle_seconds:
+            return False
+        if (
+            absolute_timeout_seconds is not None
+            and reference_time is not None
+            and now - reference_time >= absolute_timeout_seconds
+        ):
+            return False
+        logging.info(
+            "%s is still visually changing %.1fs ago, so recovery is deferred to let the current transition settle",
+            context,
+            since_visual_change,
+        )
+        return True
+
     def recover_to_main_screen(self, timeout_seconds: float = STARTUP_RECOVERY_SECONDS) -> bool:
         return self.recovery_flow.run(timeout_seconds)
 
     def try_enter_special_training(self) -> bool:
-        for attempt in range(1, 3):
+        for attempt in range(1, 2):
             if not self.check_runtime_health():
                 return False
             screenshot = self.vision.capture()
@@ -3159,17 +3346,25 @@ class CreativeModeBot:
         logging.info("No settings screen after two clicks, treating this as no-op")
         return False
 
-    def try_enter_special_training_fast(self) -> bool:
-        transition_settle_seconds = 1.0
-        transition_wait_seconds = 2.4
-        quick_main_return_fail_seconds = 0.45
+    def try_enter_special_training_fast(
+        self,
+        screenshot: np.ndarray | None = None,
+        assume_main_visible: bool = False,
+    ) -> bool:
+        transition_settle_seconds = 0.45
+        transition_wait_seconds = 6.5
+        main_return_confirmation_seconds = 1.5
+        ocr_probe_interval_seconds = 0.45
+        main_stable_after_visual_change_seconds = 0.80
         if time.time() < self.special_training_unavailable_until:
             logging.info("Fast path is skipping special training because it was recently confirmed unavailable")
             return False
-        for attempt in range(1, 3):
+        first_screenshot = screenshot
+        for attempt in range(1, 2):
             if not self.check_runtime_process_only():
                 return False
-            screenshot = self.vision.capture()
+            screenshot = first_screenshot if first_screenshot is not None else self.vision.capture()
+            first_screenshot = None
             title = self.find_special_training_title_in_screenshot(screenshot)
             if title:
                 self.special_training_unavailable_until = 0.0
@@ -3185,11 +3380,17 @@ class CreativeModeBot:
                 )
                 return True
 
-            main_visible = self.find_main_screen_in_screenshot(screenshot)
-            trusted_main = self.should_trust_main_screen(screenshot)
-            confirmed_main = False
-            if not main_visible and not trusted_main:
-                confirmed_main = self.is_confirmed_main_screen(screenshot)
+            if assume_main_visible:
+                main_visible = True
+                trusted_main = True
+                confirmed_main = True
+                logging.info("Fast path is reusing the caller-confirmed creative mode main screen before special training entry")
+            else:
+                main_visible = self.find_main_screen_in_screenshot(screenshot)
+                trusted_main = self.should_trust_main_screen(screenshot)
+                confirmed_main = False
+                if not main_visible and not trusted_main:
+                    confirmed_main = self.is_confirmed_main_screen(screenshot)
 
             if not main_visible and not trusted_main and not confirmed_main:
                 logging.info("Fast path skipped special training entry because the current screen is not a confirmed creative mode main screen")
@@ -3200,7 +3401,7 @@ class CreativeModeBot:
             if not (main_visible or trusted_main or confirmed_main):
                 continue
 
-            match = self.find_special_training_entry_on_main_screen(screenshot)
+            match = None if assume_main_visible else self.find_special_training_entry_on_main_screen(screenshot)
             if not match:
                 logging.info("Fast path using special training hotspot fallback on attempt %s", attempt)
                 self.click_main_screen_special_training_hotspot(settle=0.5)
@@ -3216,50 +3417,117 @@ class CreativeModeBot:
 
             handoff_deadline = time.time() + transition_wait_seconds
             handoff_started_at = time.time()
+            next_ocr_probe_at = handoff_started_at
+            stable_main_candidate_since: float | None = None
             while time.time() < handoff_deadline:
                 if not self.check_runtime_process_only():
                     return False
                 handoff_screenshot = self.vision.capture()
-                title = self.find_special_training_title_in_screenshot(handoff_screenshot)
-                if title:
-                    self.special_training_unavailable_until = 0.0
-                    logging.info("Entered special training page via fast path: %s", title.name)
-                    return True
-
-                special_training_screen = self.find_special_training_screen_in_screenshot(handoff_screenshot)
-                if special_training_screen:
-                    self.special_training_unavailable_until = 0.0
-                    logging.info(
-                        "Entered special training page via fast path screen markers: %s (score=%.3f)",
-                        special_training_screen.name,
-                        special_training_screen.score,
-                    )
-                    return True
-
-                if self.find_main_screen_in_screenshot(handoff_screenshot):
-                    elapsed = time.time() - handoff_started_at
-                    logging.info(
-                        "Fast path special training handoff returned to creative mode main screen after attempt %s (elapsed=%.2fs)",
-                        attempt,
-                        elapsed,
-                    )
-                    if elapsed < quick_main_return_fail_seconds:
-                        self.special_training_unavailable_until = time.time() + SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS
+                now = time.time()
+                if now >= next_ocr_probe_at:
+                    result_screen = self.find_special_training_result_screen_in_screenshot(handoff_screenshot)
+                    if result_screen:
+                        self.special_training_unavailable_until = 0.0
+                        logging.info("Entered special training result page via fast path: %s", result_screen.name)
+                        return True
+                    title = self.find_special_training_title_in_screenshot(handoff_screenshot)
+                    if title:
+                        self.special_training_unavailable_until = 0.0
+                        logging.info("Entered special training settings page via fast path: %s", title.name)
+                        return True
+                    special_training_screen = self.find_special_training_screen_in_screenshot(handoff_screenshot)
+                    if special_training_screen:
+                        self.special_training_unavailable_until = 0.0
                         logging.info(
-                            "Fast path is treating special training as unavailable after a quick return to main; cooling down for %.0fs",
-                            SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS,
+                            "Entered special training page via fast path screen markers during handoff: %s (score=%.3f)",
+                            special_training_screen.name,
+                            special_training_screen.score,
                         )
-                        return False
-                    self.special_training_unavailable_until = time.time() + SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS
-                    logging.info(
-                        "Fast path is treating special training as unavailable after a return to main without opening settings; cooling down for %.0fs",
-                        SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS,
-                    )
-                    return False
+                        return True
+                    next_ocr_probe_at = now + ocr_probe_interval_seconds
+
+                elapsed = now - handoff_started_at
+                main_visible = self.find_main_screen_in_screenshot(handoff_screenshot)
+                trusted_main = self.should_trust_main_screen(handoff_screenshot)
+                advance_button_visible = self.vision.match_best_multiscale_in_region(
+                    handoff_screenshot,
+                    MAIN_SCREEN_BUTTONS,
+                    min(self.main_threshold, 0.45),
+                    REGION_SCHEDULE_BUTTON,
+                    scales=[1.0, 0.96, 1.04],
+                ) or self.vision.match_best_multiscale_in_region(
+                    handoff_screenshot,
+                    MAIN_SCREEN_BUTTONS,
+                    min(self.main_threshold, 0.42),
+                    REGION_BOTTOM_RIGHT,
+                    scales=[1.0, 0.96, 1.04],
+                )
+                stable_after_change = now - self.last_visual_change_time >= main_stable_after_visual_change_seconds
+                strong_main_candidate = bool(main_visible or trusted_main) and bool(advance_button_visible) and stable_after_change
+                if strong_main_candidate:
+                    if stable_main_candidate_since is None:
+                        stable_main_candidate_since = now
+                else:
+                    stable_main_candidate_since = None
+
+                if stable_main_candidate_since is not None and now - stable_main_candidate_since >= main_return_confirmation_seconds and elapsed >= main_return_confirmation_seconds:
+                    # Keep waiting until the full handoff window expires; special-training OCR is often late.
+                    pass
 
                 time.sleep(0.12)
+
+            final_screenshot = self.vision.capture()
+            final_result_screen = self.find_special_training_result_screen_in_screenshot(final_screenshot)
+            if final_result_screen:
+                self.special_training_unavailable_until = 0.0
+                logging.info("Entered special training result page via fast path at the end of handoff: %s", final_result_screen.name)
+                return True
+            final_title = self.find_special_training_title_in_screenshot(final_screenshot)
+            if final_title:
+                self.special_training_unavailable_until = 0.0
+                logging.info("Entered special training settings page via fast path at the end of handoff: %s", final_title.name)
+                return True
+            final_special_training_screen = self.find_special_training_screen_in_screenshot(final_screenshot)
+            if final_special_training_screen:
+                self.special_training_unavailable_until = 0.0
+                logging.info(
+                    "Entered special training page via fast path screen markers at the end of handoff: %s (score=%.3f)",
+                    final_special_training_screen.name,
+                    final_special_training_screen.score,
+                )
+                return True
+
+            final_main_visible = self.find_main_screen_in_screenshot(final_screenshot)
+            final_trusted_main = self.should_trust_main_screen(final_screenshot)
+            final_advance_button_visible = self.vision.match_best_multiscale_in_region(
+                final_screenshot,
+                MAIN_SCREEN_BUTTONS,
+                min(self.main_threshold, 0.45),
+                REGION_SCHEDULE_BUTTON,
+                scales=[1.0, 0.96, 1.04],
+            ) or self.vision.match_best_multiscale_in_region(
+                final_screenshot,
+                MAIN_SCREEN_BUTTONS,
+                min(self.main_threshold, 0.42),
+                REGION_BOTTOM_RIGHT,
+                scales=[1.0, 0.96, 1.04],
+            )
+            final_stable_after_change = time.time() - self.last_visual_change_time >= main_stable_after_visual_change_seconds
+            if (final_main_visible or final_trusted_main) and final_advance_button_visible and final_stable_after_change:
+                elapsed = time.time() - handoff_started_at
+                logging.info(
+                    "Fast path special training handoff returned to creative mode main screen after attempt %s (elapsed=%.2fs)",
+                    attempt,
+                    elapsed,
+                )
+                self.special_training_unavailable_until = time.time() + SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS
+                logging.info(
+                    "Fast path is treating special training as unavailable because the screen stayed on creative mode main; cooling down for %.0fs",
+                    SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS,
+                )
+                return False
         self.special_training_unavailable_until = time.time() + SPECIAL_TRAINING_RETRY_COOLDOWN_SECONDS
-        logging.info("Fast path did not confirm special training settings after two attempts")
+        logging.info("Fast path did not detect special training settings/result after one attempt")
         return False
 
     def handle_confirm_dialog(self, dialog_name: str | None = None) -> bool:
@@ -3331,6 +3599,15 @@ class CreativeModeBot:
         for attempt in range(1, 7):
             if not self.check_runtime_health():
                 return False
+            initial_screenshot = self.vision.capture()
+            if self.find_special_training_result_screen_in_screenshot(initial_screenshot):
+                logging.info("Special training result screen is active, using the top-left back hotspot immediately")
+                self.click_special_training_back_hotspot(settle=0.25)
+                time.sleep(0.2)
+                screenshot = self.vision.capture()
+                if self.has_returned_to_main_from_special_training(screenshot):
+                    logging.info("Returned from special training to main screen")
+                    return True
             self.window.move_cursor_client(x_ratio=0.92, y_ratio=0.92)
             back_button = self.vision.wait_for_any(BACK_BUTTONS, self.button_threshold, timeout=1.0, interval=0.2)
             if not back_button:
@@ -3342,7 +3619,7 @@ class CreativeModeBot:
                     logging.info("Back button not detected on special training screen, clicking top-left back hotspot")
                     self.click_special_training_back_hotspot(settle=0.45)
                     continue
-                if self.handle_global_priority_buttons(max_clicks=1):
+                if self.handle_fast_main_screen_interrupts(screenshot=screenshot):
                     return True
                 logging.warning("Back button disappeared, but main screen could not be confirmed")
                 return False
@@ -3362,7 +3639,7 @@ class CreativeModeBot:
                 self.click_special_training_back_hotspot(settle=0.45)
                 continue
 
-            if self.handle_global_priority_buttons(max_clicks=1):
+            if self.handle_fast_main_screen_interrupts(screenshot=screenshot):
                 return True
 
             screenshot = self.vision.capture()
@@ -3383,6 +3660,17 @@ class CreativeModeBot:
         for attempt in range(1, 7):
             if not self.check_runtime_process_only():
                 return False
+            initial_screenshot = self.vision.capture()
+            if self.find_special_training_result_screen_in_screenshot(initial_screenshot):
+                logging.info("Fast path sees the special training result screen, using the top-left back hotspot immediately")
+                self.click_special_training_back_hotspot(settle=0.18)
+                deadline = time.time() + 0.9
+                while time.time() < deadline:
+                    screenshot = self.vision.capture()
+                    if self.has_returned_to_main_from_special_training(screenshot):
+                        logging.info("Fast path returned from special training to main screen")
+                        return True
+                    time.sleep(0.08)
             self.window.move_cursor_client(x_ratio=0.92, y_ratio=0.92)
             back_button = self.wait_for_any_in_region(
                 BACK_BUTTONS,
@@ -3414,7 +3702,7 @@ class CreativeModeBot:
                     logging.info("Fast path returned from special training to main screen")
                     return True
                 if not self.find_special_training_screen_in_screenshot(screenshot):
-                    if self.handle_global_priority_buttons(max_clicks=1, initial_screenshot=screenshot):
+                    if self.handle_fast_main_screen_interrupts(screenshot=screenshot):
                         continue
                     time.sleep(0.12)
                     continue
@@ -3454,6 +3742,9 @@ class CreativeModeBot:
                 return handled
 
             screenshot = self.vision.capture()
+            if self._handle_close_button_interrupt_from_screenshot(screenshot, min(self.button_threshold, 0.72)):
+                handled = True
+                continue
             if self.handle_story_dialog_fast(screenshot=screenshot, attempts=3):
                 handled = True
                 continue
@@ -3516,8 +3807,15 @@ class CreativeModeBot:
             and time.time() - self.last_advance_schedule_click_time <= POST_SCHEDULE_EXCEPTION_FASTLANE_SECONDS
         )
 
+    def _is_in_league_result_aftermath_fastlane(self) -> bool:
+        return (
+            self.last_league_result_time > 0
+            and time.time() - self.last_league_result_time <= LEAGUE_RESULT_AFTERMATH_FASTLANE_SECONDS
+        )
+
     def _dispatch_loop_start_fastlane(self, screenshot: np.ndarray, max_wait_seconds: float) -> bool | None:
         in_post_schedule_exception_fastlane = self._is_in_post_schedule_exception_fastlane()
+        in_league_result_aftermath_fastlane = self._is_in_league_result_aftermath_fastlane()
 
         if time.time() - self.last_save_selection_click_time <= POST_SAVE_SELECTION_ENTRY_FASTLANE_SECONDS:
             if self.handle_emergency_buttons(max_clicks=1, initial_screenshot=screenshot):
@@ -3526,8 +3824,13 @@ class CreativeModeBot:
                 logging.info("Loop start is within the post-save-selection fast lane, continuing bootstrap handling")
                 return self.run_bootstrap_flow(handoff_main_wait_seconds=max_wait_seconds)
             if self.main_flow.matches(screenshot):
+                main_step = self.main_flow.detect_step(screenshot)
                 logging.info("Loop start is within the post-save-selection fast lane, dispatching directly to main flow")
-                return self.main_flow.run(max_wait_seconds, screenshot=screenshot, assume_main_visible=True)
+                return self.main_flow.run(
+                    max_wait_seconds,
+                    screenshot=screenshot,
+                    assume_main_visible=(main_step == "creative_mode_main"),
+                )
             if self.new_season_flow.matches(screenshot):
                 self.set_active_flow("new_season")
                 logging.info("Loop start is within the post-save-selection fast lane, dispatching directly to new-season flow")
@@ -3553,6 +3856,19 @@ class CreativeModeBot:
                 logging.info("Loop start is within the post-final-confirm SP join fast lane, dispatching immediately")
                 return self.new_season_flow.run(screenshot, fast_dispatch=True)
 
+        if in_league_result_aftermath_fastlane:
+            main_step = self.main_flow.detect_step(screenshot)
+            if main_step and main_step != "creative_mode_main":
+                logging.info(
+                    "Loop start is within the season-end aftermath fast lane and main-flow step %s is visible",
+                    main_step,
+                )
+                return self.main_flow.run(max_wait_seconds, screenshot=screenshot)
+            if self.is_new_season_context_active_in_screenshot(screenshot):
+                self.set_active_flow("new_season")
+                logging.info("Loop start is within the season-end aftermath fast lane and new-season content is visible")
+                return self.new_season_flow.run(screenshot, fast_dispatch=True)
+
         sp_join_screen = self.find_sp_join_screen_in_screenshot(screenshot)
         if sp_join_screen:
             self.set_active_flow("new_season")
@@ -3560,11 +3876,13 @@ class CreativeModeBot:
             return self.new_season_flow.run(screenshot, fast_dispatch=True)
 
         if in_post_schedule_exception_fastlane:
-            if self.handle_post_schedule_events_fast(max_clicks=4):
-                return True
-            if self.find_match_reward_screen_in_screenshot(screenshot):
-                logging.info("Loop start is within the post-schedule exception fast lane and match reward is visible")
-                return self.handle_match_reward_screen()
+            main_step = self.main_flow.detect_step(screenshot)
+            if main_step and main_step != "creative_mode_main":
+                logging.info(
+                    "Loop start is within the post-schedule exception fast lane and main-flow step %s is visible",
+                    main_step,
+                )
+                return self.main_flow.run(max_wait_seconds, screenshot=screenshot)
 
         return None
 
@@ -3603,6 +3921,18 @@ class CreativeModeBot:
         if self.bootstrap_flow.matches(screenshot):
             logging.info("%s belongs to the bootstrap layer", stage_prefix)
             return self.run_bootstrap_flow(handoff_main_wait_seconds=max_wait_seconds)
+
+        main_step = self.main_flow.detect_step(screenshot)
+        if main_step:
+            logging.info("%s belongs to the main-flow layer via step %s", stage_prefix, main_step)
+            logging.info("Dispatching %s directly into main_flow.run()", stage_prefix.lower())
+            result = self.main_flow.run(
+                max_wait_seconds,
+                screenshot=screenshot,
+                assume_main_visible=(main_step == "creative_mode_main"),
+            )
+            logging.info("main_flow.run() returned %s for %s", result, stage_prefix.lower())
+            return result
 
         main_visible = self.find_main_screen_in_screenshot(screenshot)
         special_training_visible = self.find_special_training_screen_in_screenshot(screenshot)
@@ -3665,33 +3995,88 @@ class CreativeModeBot:
             fastlane_result = self._dispatch_loop_start_fastlane(initial_screenshot, max_wait_seconds)
             if fastlane_result is not None:
                 return fastlane_result
+            if self._is_in_post_schedule_exception_fastlane():
+                if self._handle_post_schedule_ok_interrupt_from_screenshot(
+                    initial_screenshot,
+                    min(self.button_threshold, 0.72),
+                ):
+                    return True
+            if self.handle_emergency_buttons(max_clicks=1, initial_screenshot=initial_screenshot):
+                return True
+            initial_main_step = self.main_flow.detect_step(initial_screenshot)
+            if initial_main_step and initial_main_step != "creative_mode_main":
+                logging.info("Loop start directly detected main-flow step %s before generic dispatch", initial_main_step)
+                return self.main_flow.run(max_wait_seconds, screenshot=initial_screenshot)
+            in_startup_bootstrap_mode = self.last_stage_signature in {"initializing", "restarted"}
+            if in_startup_bootstrap_mode:
+                if self.bootstrap_flow.matches(initial_screenshot):
+                    logging.info("Loop start is in startup bootstrap mode, skipping generic prechecks and dispatching directly")
+                    return self.run_bootstrap_flow(handoff_main_wait_seconds=max_wait_seconds)
+                logging.info("Loop start is in startup bootstrap mode, skipping new-season/common prechecks before stage dispatch")
+                stage_result = self._dispatch_loop_start_by_stage(initial_screenshot, max_wait_seconds)
+                if stage_result is not None:
+                    return stage_result
             if self.is_new_season_context_active_in_screenshot(initial_screenshot):
                 self.set_active_flow("new_season")
                 logging.info("Loop start is already inside the active new-season context, dispatching before common flow")
                 return self.new_season_flow.run(initial_screenshot, fast_dispatch=True)
             initial_main_match = self.find_main_screen_in_screenshot(initial_screenshot)
             if initial_main_match and self.is_confirmed_main_screen(initial_screenshot):
-                logging.info("Loop start strongly confirms the creative-mode main screen, dispatching before common flow")
-                stage_result = self._dispatch_loop_start_by_stage(initial_screenshot, max_wait_seconds)
-                if stage_result is not None:
-                    return stage_result
+                logging.info("Loop start strongly confirms the creative-mode main screen, dispatching directly into main_flow.fast_path()")
+                return self.main_flow.fast_path(max_wait_seconds, screenshot=initial_screenshot, assume_main_visible=True)
             elif initial_main_match:
-                logging.info("Loop start saw a weak main-screen match, but confirmation failed; falling back to common/stage handling")
-            if self.common_flow.run_once(initial_screenshot, max_clicks=1):
-                return True
+                logging.info("Loop start saw a weak main-screen match, but confirmation failed; falling back to stage/recovery handling")
             stage_result = self._dispatch_loop_start_by_stage(initial_screenshot, max_wait_seconds)
             if stage_result is not None:
                 return stage_result
         if not self.check_runtime_health():
             return False
-        if self.common_flow.run_once(max_clicks=4):
+        recent_stage, recent_stage_screenshot = self.get_recent_stage_probe(max_age_seconds=1.2)
+        if recent_stage_screenshot is not None and recent_stage == "creative_mode_main":
+            logging.info("Current stage recently confirmed the creative-mode main screen, dispatching directly into main_flow.fast_path()")
+            return self.main_flow.fast_path(max_wait_seconds, screenshot=recent_stage_screenshot, assume_main_visible=True)
+        if recent_stage_screenshot is not None and self._is_in_post_schedule_exception_fastlane():
+            if self._handle_post_schedule_ok_interrupt_from_screenshot(
+                recent_stage_screenshot,
+                min(self.button_threshold, 0.72),
+            ):
+                return True
+        if recent_stage_screenshot is not None and self.handle_emergency_buttons(max_clicks=1, initial_screenshot=recent_stage_screenshot):
             return True
+        if recent_stage_screenshot is not None:
+            recent_main_step = self.main_flow.detect_step(recent_stage_screenshot)
+            if recent_main_step and recent_main_step != "creative_mode_main":
+                logging.info("Current stage recently detected main-flow step %s before generic dispatch", recent_main_step)
+                return self.main_flow.run(max_wait_seconds, screenshot=recent_stage_screenshot)
+        if recent_stage_screenshot is not None and recent_stage in {"creative_mode_main", "special_training"}:
+            current_stage_result = self._dispatch_current_stage(recent_stage_screenshot, max_wait_seconds)
+            if current_stage_result is not None:
+                return current_stage_result
 
         screenshot = self.vision.capture()
         current_stage_result = self._dispatch_current_stage(screenshot, max_wait_seconds)
         if current_stage_result is not None:
             return current_stage_result
-        if self.common_flow.handle_exception(screenshot=screenshot, max_clicks=1):
+        if self._is_in_post_schedule_exception_fastlane():
+            if self._handle_post_schedule_ok_interrupt_from_screenshot(
+                screenshot,
+                min(self.button_threshold, 0.72),
+            ):
+                return True
+        if self.handle_emergency_buttons(max_clicks=1, initial_screenshot=screenshot):
+            return True
+        late_main_step = self.main_flow.detect_step(screenshot)
+        if late_main_step and late_main_step != "creative_mode_main":
+            logging.info("Late current stage detected main-flow step %s before recovery", late_main_step)
+            return self.main_flow.run(max_wait_seconds, screenshot=screenshot)
+
+        if self.handle_connecting_screen():
+            return True
+
+        if self.should_defer_recovery_for_recent_visual_change(
+            context="Current screen did not match a formal flow",
+        ):
+            time.sleep(0.8)
             return True
 
         if not self.recover_to_main_screen():
@@ -3783,15 +4168,9 @@ def main() -> int:
             game_exe_path=game_exe_path,
         )
 
-        if window.is_process_running():
-            if not bot.ensure_attached():
-                if not bot.restart_game("game window could not be attached at startup"):
-                    logging.error("Initial recovery failed; keeping script alive and retrying shortly")
-                    time.sleep(10.0)
-        else:
-            if not bot.restart_game("game process missing at startup"):
-                logging.error("Initial game launch failed; keeping script alive and retrying shortly")
-                time.sleep(10.0)
+        if not bot.restart_game("fresh startup reset before bootstrap"):
+            logging.error("Initial game restart failed; keeping script alive and retrying shortly")
+            time.sleep(10.0)
 
         iteration = 1
         consecutive_loop_exceptions = 0
